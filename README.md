@@ -62,7 +62,7 @@
 
 ## 软件滤镜
 
-### 未来将会大量软件滤镜
+### 未来将会除去大量软件滤镜
 
 492 个内置滤镜全量保留，含 libzimg (zscale)、libass (drawtext/subtitles) 等高质量外部库滤镜。
 
