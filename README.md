@@ -1,107 +1,326 @@
 # ffmpeg-nvenc-lite
 
-基于 FFmpeg n8.1.1 的专用 GPU 转码工具，面向 NVIDIA 显卡用户。
+基于 FFmpeg n8.1.2 的 NVIDIA GPU 专用转码构建，面向 Windows 用户。
+
+本项目专注于：
+
+> 现代格式解码 → CUDA 滤镜处理 → NVENC 编码输出 HEVC / AV1
+
+目标不是做“全功能 FFmpeg”，而是构建一个体积更小、组件更少、路径更明确的 GPU 转码版 `ffmpeg.exe`。
+
+---
 
 ## 设计目标
 
-解码任意格式 → CUDA/NPP 滤镜处理 → NVENC 编码输出 HEVC 或 AV1。
-全程 GPU 流水线，零 CPU 编码回退。
+* 只保留必要编码器，禁用 x264 / x265 / SVT-AV1 等软件编码器
+* 使用 NVENC 输出 HEVC / AV1
+* 使用 CUDA / NVDEC / libdav1d 覆盖常见转码输入
+* 使用 CUDA 滤镜完成缩放、色彩、反交错、叠加、填充、基础降噪
+* 剔除 NPP、字幕渲染栈、图片编码器、质量评测滤镜和大量非必要组件
+* 尽量减少误调用 CPU 滤镜导致的性能回退
+
+---
+
+## 版本信息
+
+| 项目           | 版本 / 配置                         |
+| ------------ | ------------------------------- |
+| FFmpeg       | n8.1.2                          |
+| Compiler     | GCC 13-posix                    |
+| Target       | Windows x86_64                  |
+| Toolchain    | Linux / WSL2 → MinGW-w64        |
+| CUDA         | CUDA 13.3.0                     |
+| GPU 架构       | SM 7.5 / 8.0 / 8.6 / 8.9 / 12.0 |
+| CPU baseline | x86-64-v3                       |
+| Link         | Static build                    |
+| ffprobe      | 默认不构建                           |
 
 ---
 
 ## 编码器
 
-| 编码器 | 类型 | 说明 |
-|---|---|---|
-| hevc_nvenc | 视频 | H.265 硬件编码 |
-| av1_nvenc | 视频 | AV1 硬件编码（需 RTX 40xx+）|
-| libfdk_aac | 音频 | AAC 高质量编码 |
+| 编码器               | 类型      | 说明                                     |
+| ----------------- | ------- | -------------------------------------- |
+| `hevc_nvenc`      | 视频      | H.265 / HEVC NVENC 硬件编码                |
+| `av1_nvenc`       | 视频      | AV1 NVENC 硬件编码                         |
+| `libfdk_aac`      | 音频      | Fraunhofer FDK AAC 高质量编码               |
+| `aac_at`          | 音频      | Apple AudioToolbox AAC 编码              |
+| `wrapped_avframe` | 内部 / 测试 | 用于 `-f null -`、滤镜 smoke test、benchmark |
 
-仅保留以上 3 个编码器，所有软件编码器（x264, x265, SVT-AV1 等）均已移除，二进制体积最小化。
+> 所有通用软件视频编码器均已禁用，视频编码路径只保留 NVENC。
+
+注意：`aac_at` 依赖 AudioToolboxWrapper。部分环境可能仍需要可加载的 Apple CoreAudioToolbox 运行时；如果只追求稳定 AAC 输出，推荐使用 `libfdk_aac`。
 
 ---
 
 ## 解码器
 
-### 未来将会除去部分解码器
+本构建使用 decoder 白名单，而不是 FFmpeg 默认全量 decoder。
 
-493 个解码器全量保留，覆盖：
+### 视频 decoder
 
-- **现代视频：** H.264, HEVC, AV1, VP8, VP9, VVC (H.266), ProRes, DNxHD
-- **传统视频：** MPEG-1/2/4, WMV, RealVideo, Theora, Cinepak, Indeo, Bink
-- **图像：** MJPEG, JPEG2000, PNG, WebP, BMP, TIFF, GIF, DPX, EXR
-- **现代音频：** AAC, MP3, Opus, Vorbis, FLAC, ALAC, WavPack, TrueHD, E-AC3, AC-3, DTS
-- **传统音频：** RealAudio, WMA 全系, AMR, aptX, SBC
-- **字幕：** SRT, SSA/ASS, WebVTT, PGS, DVB
+| 类型      | 保留内容                                                     |
+| ------- | -------------------------------------------------------- |
+| 现代主流    | `h264`, `hevc`, `av1`, `libdav1d`, `vp9`, `vp8`          |
+| 常见兼容    | `mpeg2video`, `mpeg4`, `msmpeg4v3`, `vc1`, `wmv3`        |
+| 中间格式    | `prores`, `dnxhd`, `cfhd`                                |
+| 图像输入    | `mjpeg`, `jpeg2000`, `png`, `webp`, `bmp`, `tiff`, `gif` |
+| 原始 / 内部 | `rawvideo`, `wrapped_avframe`                            |
 
----
+`libdav1d` 用于可靠的 AV1 软件解码。对于 AV1 输入文件，如果 NVDEC 或 FFmpeg native AV1 路径不稳定，可以显式使用：
 
-## CUDA 滤镜（10 个）
+```powershell
+.\ffmpeg.exe -c:v libdav1d -i input_av1.mkv ...
+```
 
-| 滤镜 | 功能 |
-|---|---|
-| scale_cuda | GPU 缩放 |
-| bilateral_cuda | GPU 双边降噪 |
-| bwdif_cuda | GPU Bob Weaver 去隔行 |
-| yadif_cuda | GPU Yadif 去隔行 |
-| chromakey_cuda | GPU 色度键抠像 |
-| colorspace_cuda | GPU 色彩空间转换 |
-| overlay_cuda | GPU 视频叠加 |
-| pad_cuda | GPU 填充/加边框 |
-| thumbnail_cuda | GPU 缩略图选取 |
-| hwupload_cuda | CPU→CUDA 帧上传 |
+### 音频 decoder
 
-## NPP 滤镜（2 个）
+保留常见转码和封装所需音频 decoder：
 
-| 滤镜 | 功能 |
-|---|---|
-| sharpen_npp | NPP 锐化（弥补无 sharpen_cuda）|
-| transpose_npp | NPP 旋转/转置 |
+```text
+aac, mp3, ac3, eac3, truehd, dca, flac, opus, vorbis,
+wavpack, alac,
+pcm_s16le, pcm_s24le, pcm_s32le, pcm_f32le, pcm_f64le
+```
 
-> scale_npp / scale2ref_npp 已显式禁用，功能由 scale_cuda 覆盖。
+### 字幕
 
-## 软件滤镜
+本构建不保留字幕解码、字幕编码、字幕烧录和字幕渲染滤镜。
 
-### 未来将会除去大量软件滤镜
-
-492 个内置滤镜全量保留，含 libzimg (zscale)、libass (drawtext/subtitles) 等高质量外部库滤镜。
+目标仅保留容器层面的 `-c:s copy` 能力。字幕 copy 是否成功取决于输入 / 输出容器是否支持该字幕 packet。推荐需要保留字幕时输出 MKV。
 
 ---
 
-## 增强特性
+## CUDA 滤镜
 
-### CUDA / NVENC / NVDEC
-- CUDA Toolkit 13.3.0，NVCC 编译（非 LLVM）
-- NVENC 硬件编码：HEVC + AV1
-- NVDEC 硬件解码：通过 `-hwaccel cuda` 启用
-- NPP 13.1.2.48 提供额外 GPU 滤镜
+| 滤镜                | 功能                 |
+| ----------------- | ------------------ |
+| `scale_cuda`      | GPU 缩放             |
+| `bilateral_cuda`  | GPU 双边滤波 / 基础降噪    |
+| `bwdif_cuda`      | GPU BWDIF 反交错      |
+| `yadif_cuda`      | GPU YADIF 反交错      |
+| `chromakey_cuda`  | GPU 色度键            |
+| `colorspace_cuda` | GPU 色彩范围转换         |
+| `overlay_cuda`    | GPU 视频叠加           |
+| `pad_cuda`        | GPU 填充 / 加边框       |
+| `thumbnail_cuda`  | GPU 缩略图选帧          |
+| `hwupload_cuda`   | CPU frame 上传到 CUDA |
+| `hwdownload`      | CUDA frame 下载到 CPU |
+| `hwmap`           | 硬件帧映射              |
 
-### GPU 架构支持
-- SM 7.5 — Turing（RTX 20xx, GTX 16xx）
-- SM 8.0 — Ampere（A100）
-- SM 8.6 — Ampere（RTX 30xx）
-- SM 8.9 — Ada Lovelace（RTX 40xx）
-- SM 12.0 — Blackwell（RTX 50xx）
+---
 
-覆盖 2018 年至今所有主流 NVIDIA GPU。
+## 基础软件滤镜
 
-### x86-64-v3 CPU 基线
-- 要求 AVX2 + FMA + BMI2（Intel Haswell / AMD Excavator 及以上）
-- 启用 -O2 优化、LTO 链接时优化、section GC 死代码消除
-- NVCC device 代码使用 -O3 + fast_math + extra-device-vectorization
+由于本构建使用 `--disable-filters`，仅保留必要基础滤镜：
 
-### 字幕渲染栈
-- libass + libfreetype + libharfbuzz + libfontconfig + libfribidi
-- 支持 ASS/SSA 高级字幕特效、Unicode 双向文本、系统字体自动发现
+```text
+format, aformat,
+null, anull,
+fps,
+trim, atrim,
+setpts, asetpts,
+settb, asettb,
+setparams, setsar,
+aresample
+```
 
-### 完全静态链接
-- 零 DLL 依赖，单文件即用
-- 跨平台构建：Linux → Windows（x86_64-w64-mingw32）
+同时保留少量 CPU 几何滤镜作为实用回退：
+
+```text
+crop, hflip, vflip, rotate, transpose
+```
+
+这些滤镜不是 CUDA 滤镜。如果你追求更极限的 GPU-only 构建，可以在脚本中继续移除它们。
+
+---
+
+## 已移除 / 不包含
+
+### 不包含 NPP
+
+本构建不启用 `libnpp`，也不包含任何 `*_npp` 滤镜：
+
+```text
+scale_npp, scale2ref_npp, sharpen_npp, transpose_npp
+```
+
+### 不包含质量评测滤镜
+
+本构建默认不包含：
+
+```text
+libvmaf, libvmaf_cuda, psnr, ssim, xpsnr
+```
+
+原因是 FFmpegFreeUI 等 GUI 的质量评测路径通常还依赖 `ffprobe`、`scale`、`wrapped_avframe`、VMAF 模型、双输入滤镜链等大量组件。为了保持转码构建精简，本项目不默认内置评测功能。
+
+如需质量评测，建议单独维护 `ffmpeg-eval.exe`。
+
+### 不包含字幕渲染栈
+
+默认禁用：
+
+```text
+libass, freetype, fontconfig, fribidi, harfbuzz
+subtitles, ass, drawtext, textsub
+```
+
+### 不包含 FFmpeg 原生 BM3D
+
+当前 FFmpeg 构建不包含：
+
+```text
+bm3d
+bm3d_cuda
+```
+
+FFmpeg 官方有 CPU `bm3d` 滤镜，但本构建未启用。CUDA BM3D 推荐走 VapourSynth-BM3DCUDA，而不是期待 `ffmpeg.exe -vf bm3d_cuda`。
+
+---
+
+## 容器与封装
+
+### Demuxer
+
+保留常见输入：
+
+```text
+matroska, mov, mpegts,
+h264, hevc, av1,
+rawvideo, image2, concat,
+aac, mp3, flac, ogg, wav
+```
+
+### Muxer
+
+保留常见输出：
+
+```text
+matroska, mp4, mpegts,
+null, rawvideo, image2,
+adts, flac, ogg, wav
+```
+
+### Bitstream filters
+
+```text
+h264_mp4toannexb
+hevc_mp4toannexb
+av1_metadata
+h264_metadata
+hevc_metadata
+aac_adtstoasc
+extract_extradata
+```
+
+---
+
+## 示例命令
+
+### HEVC / AV1 输入 → AV1 NVENC 输出
+
+```powershell
+.\ffmpeg.exe -hide_banner -y `
+  -hwaccel cuda -hwaccel_output_format cuda `
+  -i "input.mkv" `
+  -vf "scale_cuda=1920:1080:interp_algo=lanczos" `
+  -c:v av1_nvenc -preset p7 -cq 34 `
+  -c:a libfdk_aac -vbr 5 `
+  "output.mkv"
+```
+
+### AV1 输入强制使用 libdav1d 软件解码
+
+```powershell
+.\ffmpeg.exe -hide_banner -y `
+  -c:v libdav1d `
+  -i "input_av1.mkv" `
+  -vf "format=yuv420p10le,hwupload_cuda,scale_cuda=1920:1080:interp_algo=lanczos" `
+  -c:v av1_nvenc -preset p7 -cq 34 `
+  -c:a copy `
+  "output.mkv"
+```
+
+### CUDA 双边降噪
+
+```powershell
+.\ffmpeg.exe -hide_banner -y `
+  -hwaccel cuda -hwaccel_output_format cuda `
+  -i "input.mkv" `
+  -vf "bilateral_cuda=sigmaS=3.0:sigmaR=50.0:window_size=9" `
+  -c:v hevc_nvenc -preset p7 -cq 28 `
+  -c:a copy `
+  "output.mkv"
+```
+
+### 保留字幕 packet copy
+
+```powershell
+.\ffmpeg.exe -hide_banner -y `
+  -i "input.mkv" `
+  -map 0:v -map 0:a? -map 0:s? `
+  -c:v av1_nvenc -preset p7 -cq 34 `
+  -c:a copy `
+  -c:s copy `
+  "output.mkv"
+```
+
+---
+
+## 验证命令
+
+```powershell
+.\ffmpeg.exe -hide_banner -encoders
+.\ffmpeg.exe -hide_banner -decoders
+.\ffmpeg.exe -hide_banner -filters
+.\ffmpeg.exe -hide_banner -hwaccels
+.\ffmpeg.exe -hide_banner -demuxers
+.\ffmpeg.exe -hide_banner -muxers
+.\ffmpeg.exe -hide_banner -bsfs
+```
+
+关键检查：
+
+```powershell
+.\ffmpeg.exe -hide_banner -encoders | findstr /i "nvenc libfdk_aac aac_at wrapped_avframe"
+.\ffmpeg.exe -hide_banner -decoders | findstr /i "libdav1d av1 h264 hevc vp9"
+.\ffmpeg.exe -hide_banner -filters  | findstr /i "cuda bilateral scale_cuda"
+.\ffmpeg.exe -hide_banner -filters  | findstr /i "_npp libvmaf psnr ssim xpsnr bm3d subtitles drawtext"
+```
+
+最后一条在本构建中应无输出，或只出现非目标误匹配项。
 
 ---
 
 ## 系统要求
 
-- **GPU：** NVIDIA GTX 16xx / RTX 20xx 及以上
-- **CPU：** 支持 AVX2 的 x86-64 处理器（2013 年后）
-- **OS：** Windows 10/11 64-bit
+| 项目        | 要求                             |
+| --------- | ------------------------------ |
+| OS        | Windows 10 / 11 x64            |
+| GPU       | NVIDIA GTX 16xx / RTX 20xx 及以上 |
+| AV1 NVENC | RTX 40xx 及以上推荐                 |
+| CPU       | 支持 x86-64-v3 的处理器              |
+| Driver    | 建议使用较新的 NVIDIA 驱动              |
+
+---
+
+## 适用场景
+
+适合：
+
+* NVIDIA 显卡用户
+* HEVC / AV1 硬件编码
+* CUDA 缩放、色彩、反交错、基础降噪
+* 精简单用途压制工具
+* 不需要完整 FFmpeg 生态的专用构建
+
+不适合：
+
+* 字幕烧录
+* 质量评测
+* 全格式考古解码
+* 图片编码
+* 软件编码器压制
+* FFmpegFreeUI 全功能模式
+* BM3D / AI 降噪一体化处理
