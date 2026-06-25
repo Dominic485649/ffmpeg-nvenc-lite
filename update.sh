@@ -2,20 +2,16 @@
 set -Eeuo pipefail
 
 ROOT="${ROOT:-$HOME/ffmpeg}"
+FFMPEG_REF="${FFMPEG_REF:-n8.1.2}"
 
-# 只保留当前目标实际需要的源码：FFmpeg、NVIDIA headers、fdk-aac、字幕/字体/缩放相关库。
-# SVT-AV1 已按目标删除；AV1 只使用 av1_nvenc。
+# 只保留当前目标实际需要的源码：FFmpeg、NVIDIA headers、fdk-aac、字幕/字体/缩放相关库，以及新增的 vmaf, libopus, AudioToolboxWrapper
 declare -A URLS=(
   [ffmpeg-source]="https://git.ffmpeg.org/ffmpeg.git"
   [nv-codec-headers]="https://github.com/FFmpeg/nv-codec-headers.git"
   [fdk-aac]="https://github.com/mstorsjo/fdk-aac.git"
   [zimg]="https://github.com/sekrit-twc/zimg.git"
-  [freetype]="https://github.com/freetype/freetype.git"
-  [harfbuzz]="https://github.com/harfbuzz/harfbuzz.git"
-  [fribidi]="https://github.com/fribidi/fribidi.git"
-  [libass]="https://github.com/libass/libass.git"
-  [fontconfig]="https://gitlab.freedesktop.org/fontconfig/fontconfig.git"
-  [expat]="https://github.com/libexpat/libexpat.git"
+  [AudioToolboxWrapper]="https://github.com/dantmnf/AudioToolboxWrapper.git"
+  [dav1d]="https://code.videolan.org/videolan/dav1d.git"
 )
 
 declare -A TAG_REGEX=(
@@ -23,12 +19,8 @@ declare -A TAG_REGEX=(
   [nv-codec-headers]='^n[0-9]+(\.[0-9]+)*$'
   [fdk-aac]='^v?[0-9]+(\.[0-9]+)*$'
   [zimg]='^release-[0-9]+(\.[0-9]+)*$'
-  [freetype]='^(VER-[0-9]+(-[0-9]+)+|freetype-[0-9]+(\.[0-9]+)*)$'
-  [harfbuzz]='^v?[0-9]+(\.[0-9]+)*$'
-  [fribidi]='^v?[0-9]+(\.[0-9]+)*$'
-  [libass]='^v?[0-9]+(\.[0-9]+)*$'
-  [fontconfig]='^(upstream/)?[0-9]+(\.[0-9]+)*$'
-  [expat]='^R_[0-9]+(_[0-9]+)+$'
+  [AudioToolboxWrapper]='.*'
+  [dav1d]='^[0-9]+(\.[0-9]+)*$'
 )
 
 normalize_version() {
@@ -73,7 +65,7 @@ clone_if_missing() {
   local url="${URLS[$name]}"
 
   if [[ ! -d "$repo_dir/.git" ]]; then
-    echo "===> clone $name"
+    echo "===> clone $name from $url"
     git clone "$url" "$repo_dir"
   fi
 }
@@ -109,6 +101,7 @@ checkout_stable() {
   ver="$(normalize_version "$name" "$tag")"
 
   if [[ "$name" == "ffmpeg-source" ]]; then
+    git -C "$repo_dir" branch -D "build-$ver" 2>/dev/null || true
     git -C "$repo_dir" switch -C "build-$ver" "$tag"
   else
     git -C "$repo_dir" switch --detach "$tag" 2>/dev/null || \
@@ -116,7 +109,12 @@ checkout_stable() {
   fi
 
   git -C "$repo_dir" submodule update --init --recursive || true
-  echo "     -> $name => $tag"
+  
+  local commit_hash
+  commit_hash="$(git -C "$repo_dir" rev-parse HEAD)"
+  local remote_url
+  remote_url="$(git -C "$repo_dir" remote get-url origin)"
+  echo "     -> $name: source=$remote_url, ref=$tag, commit=$commit_hash"
 }
 
 update_one() {
@@ -128,14 +126,27 @@ update_one() {
   echo "===> sanitize $name"
   sanitize_repo "$repo_dir"
 
+  # Force remote to HTTPS to avoid SSH timeouts
+  local url="${URLS[$name]}"
+  git -C "$repo_dir" remote set-url origin "$url" 2>/dev/null || true
+
   echo "===> fetch $name"
   git -C "$repo_dir" fetch --tags --prune origin
 
-  local tag
-  tag="$(latest_stable_tag "$name")"
+  local tag=""
+  if [[ "$name" == "ffmpeg-source" ]]; then
+    tag="$FFMPEG_REF"
+  else
+    tag="$(latest_stable_tag "$name")"
+  fi
+
   if [[ -z "$tag" ]]; then
-    echo "ERROR: no stable tag matched for $name"
-    exit 1
+    # Fallback to master/main for tagless repositories like AudioToolboxWrapper
+    tag="master"
+    if ! git -C "$repo_dir" show-ref --verify --quiet "refs/remotes/origin/$tag"; then
+      tag="main"
+    fi
+    echo "No stable tag matched for $name, falling back to branch $tag"
   fi
 
   checkout_stable "$name" "$tag"
@@ -144,7 +155,7 @@ update_one() {
 usage() {
   cat <<EOF
 用法:
-  ./update.sh           # 更新完整 FFmpeg 构建所需源码，已不包含 SVT-AV1
+  ./update.sh           # 更新完整 FFmpeg 构建所需源码
   ./update.sh --fdkaac  # 只更新 fdkaac.sh 所需源码
 EOF
 }
@@ -157,12 +168,8 @@ main() {
     nv-codec-headers
     fdk-aac
     zimg
-    freetype
-    harfbuzz
-    fribidi
-    libass
-    fontconfig
-    expat
+    AudioToolboxWrapper
+    dav1d
   )
 
   if [[ "$#" -gt 1 ]]; then
@@ -192,7 +199,7 @@ main() {
   done
 
   echo
-  echo "All selected source trees are now on latest stable tags."
+  echo "All selected source trees are now on latest stable tags or branches."
 }
 
 main "$@"
