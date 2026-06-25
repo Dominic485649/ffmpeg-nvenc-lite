@@ -9,7 +9,7 @@ JOBS="${JOBS:-$(nproc)}"
 FFMPEG_JOBS="${FFMPEG_JOBS:-$JOBS}"
 
 # 目标：交叉编译 Windows ffmpeg.exe。默认启用 O2 + LTO。
-OPT_CFLAGS_BASE="${OPT_CFLAGS_BASE:--O2 -pipe -DNDEBUG}"
+OPT_CFLAGS_BASE="${OPT_CFLAGS_BASE:--O2 -pipe -DNDEBUG -funwind-tables -fexceptions}"
 INLINE_ENABLE="${INLINE_ENABLE:-1}"
 INLINE_FLAGS="${INLINE_FLAGS:--finline-functions -finline-small-functions -findirect-inlining}"
 SECTION_GC_ENABLE="${SECTION_GC_ENABLE:-1}"
@@ -30,14 +30,8 @@ NVCC_THREADS="${NVCC_THREADS:-0}"
 NVCC_PTXAS_FLAGS="${NVCC_PTXAS_FLAGS:--O3}"
 NVCC_FAST_MATH="${NVCC_FAST_MATH:-1}"
 
-# NPP 只能在依赖真实满足时启用。auto=满足则启用 sharpen_npp/transpose_npp，否则跳过并报告原因。
-NPP_ENABLE="${NPP_ENABLE:-auto}" # auto|1|0
-NPP_REDIST_ROOT="${NPP_REDIST_ROOT:-$ROOT/toolchains/cuda-redist-13.3.0/install/windows-npp/libnpp-windows-x86_64-13.1.2.48-archive}"
-NPP_ROOT="${NPP_ROOT:-}"
-NPP_INCLUDE_DIR="${NPP_INCLUDE_DIR:-}"
-NPP_LIBDIR="${NPP_LIBDIR:-}"
-NPP_STATUS="disabled"
-NPP_REASON=""
+AAC_AT_ENABLE="${AAC_AT_ENABLE:-1}"
+
 
 COMMON_OPT_FLAGS=""
 COMMON_LDFLAGS=""
@@ -49,39 +43,51 @@ START_STAGE=""
 STAGES=(
   "nv-codec-headers"
   "fdk-aac"
+  "AudioToolboxWrapper"
   "zimg"
-  "freetype"
-  "harfbuzz"
-  "fribidi"
-  "expat"
-  "fontconfig"
-  "libass"
+  "dav1d"
   "ffmpeg"
 )
 
-CUDA_FILTERS=(
-  bilateral_cuda
-  bwdif_cuda
-  chromakey_cuda
-  colorspace_cuda
-  hwupload_cuda
+ALLOWED_FILTERS=(
+  scale_cuda
   overlay_cuda
   pad_cuda
-  scale_cuda
-  thumbnail_cuda
+  colorspace_cuda
   yadif_cuda
-)
+  bwdif_cuda
+  bilateral_cuda
+  chromakey_cuda
+  thumbnail_cuda
+  hwupload_cuda
+  hwdownload
+  hwmap
 
-# 本地 FFmpeg 没有 sharpen_cuda；若 NPP 可用，用 sharpen_npp 补充。
-# 本地 FFmpeg 没有 transpose_cuda；NPP 13 的 rotate/transpose 已补丁为 _Ctx API 后可作为补充。
-# scale_npp/scale2ref_npp 与 scale_cuda 重复，因此即使启用 libnpp 也显式禁用。
-NPP_COMPLEMENT_FILTERS=(
-  sharpen_npp
-  transpose_npp
-)
-NPP_DUPLICATE_FILTERS=(
-  scale_npp
-  scale2ref_npp
+  buffer
+  buffersink
+  abuffer
+  abuffersink
+  format
+  aformat
+  null
+  anull
+  fps
+  trim
+  atrim
+  setpts
+  asetpts
+  settb
+  asettb
+  setparams
+  setsar
+  aresample
+
+  transpose
+  crop
+  hflip
+  vflip
+  rotate
+  bm3d_cuda
 )
 
 normalize_stage() {
@@ -90,13 +96,9 @@ normalize_stage() {
   case "$s" in
     nv|nvcodec|nv-codec|nv-codec-headers|ffnvcodec) echo "nv-codec-headers" ;;
     fdkaac|fdk-aac|fdk) echo "fdk-aac" ;;
+    audiotoolboxwrapper|atw|audiotoolbox) echo "AudioToolboxWrapper" ;;
     zimg) echo "zimg" ;;
-    freetype|ft) echo "freetype" ;;
-    harfbuzz|hb) echo "harfbuzz" ;;
-    fribidi|bidi) echo "fribidi" ;;
-    expat|xml) echo "expat" ;;
-    fontconfig|fc) echo "fontconfig" ;;
-    libass|ass) echo "libass" ;;
+    dav1d) echo "dav1d" ;;
     ffmpeg) echo "ffmpeg" ;;
     svt|svt-av1|svtav1|svt-av1-hdr|svtav1hdr)
       echo "SVT-AV1 已按目标从构建脚本删除，不再支持该阶段" >&2
@@ -112,11 +114,10 @@ usage() {
   ./build.sh                  # 全量交叉编译 Windows ffmpeg.exe，默认 O2 + LTO
   ./build.sh --ffmpeg         # 只重新配置并编译 FFmpeg
   CUDA_ENABLE=0 ./build.sh    # 禁用 CUDA 滤镜/NVCC，仅保留 NVENC/NVDEC 头文件能力
-  NPP_ENABLE=1 ./build.sh --ffmpeg   # 强制要求 NPP；依赖不满足则失败
+  AAC_AT_ENABLE=0 ./build.sh  # 禁用 aac_at 音频编码器
 
 支持的阶段:
-  --nv-codec-headers --fdkaac --zimg --freetype --harfbuzz --fribidi
-  --expat --fontconfig --libass --ffmpeg
+  --nv-codec-headers --fdkaac --audiotoolboxwrapper --zimg --vmaf --ffmpeg
 
 核心默认值:
   OPT_CFLAGS_BASE="$OPT_CFLAGS_BASE"
@@ -126,7 +127,6 @@ usage() {
   NVCC_GENCODE_FLAGS="$NVCC_GENCODE_FLAGS"
   NVCC_OPTFLAGS="$NVCC_OPTFLAGS"
   NVCC_FAST_MATH=$NVCC_FAST_MATH
-  NPP_ENABLE=$NPP_ENABLE
 EOF
 }
 
@@ -385,74 +385,7 @@ check_cpu_flags() {
   rm -f "$tmp"
 }
 
-npp_find_defaults() {
-  if [[ -n "$NPP_ROOT" ]]; then
-    NPP_INCLUDE_DIR="${NPP_INCLUDE_DIR:-$NPP_ROOT/include}"
-    NPP_LIBDIR="${NPP_LIBDIR:-$NPP_ROOT/lib}"
-  elif [[ -d "$NPP_REDIST_ROOT" ]]; then
-    NPP_INCLUDE_DIR="${NPP_INCLUDE_DIR:-$NPP_REDIST_ROOT/include}"
-    NPP_LIBDIR="${NPP_LIBDIR:-$NPP_REDIST_ROOT/lib/x64}"
-  else
-    NPP_INCLUDE_DIR="${NPP_INCLUDE_DIR:-$CUDA_HOME/include}"
-    NPP_LIBDIR="${NPP_LIBDIR:-$CUDA_HOME/lib64}"
-  fi
-}
 
-npp_has_library() {
-  local lib="$1"
-  [[ -f "$NPP_LIBDIR/lib${lib}.a" || -f "$NPP_LIBDIR/lib${lib}.dll.a" || -f "$NPP_LIBDIR/${lib}.lib" ]]
-}
-
-npp_preflight() {
-  NPP_STATUS="disabled"
-  NPP_REASON="NPP_ENABLE=$NPP_ENABLE"
-
-  if [[ "$NPP_ENABLE" == "0" ]]; then
-    return 1
-  fi
-  if [[ "$CUDA_ENABLE" != "1" ]]; then
-    NPP_REASON="CUDA_ENABLE=$CUDA_ENABLE，NPP 依赖 CUDA"
-    return 1
-  fi
-
-  npp_find_defaults
-
-  if [[ ! -f "$NPP_INCLUDE_DIR/npp.h" || ! -f "$NPP_INCLUDE_DIR/nppi.h" || ! -f "$NPP_INCLUDE_DIR/nppi_filtering_functions.h" ]]; then
-    NPP_REASON="未找到 NPP 头文件: $NPP_INCLUDE_DIR/npp.h、nppi.h 和 nppi_filtering_functions.h"
-    return 1
-  fi
-
-  if ! grep -R "nppiFilterSharpenBorder_8u_C1R_Ctx[[:space:]]*(" "$NPP_INCLUDE_DIR" >/dev/null 2>&1; then
-    NPP_REASON="当前 NPP 头文件不包含 sharpen_npp 所需的 nppiFilterSharpenBorder_8u_C1R_Ctx"
-    return 1
-  fi
-  if ! grep -R "nppiRotate_8u_C1R_Ctx[[:space:]]*(" "$NPP_INCLUDE_DIR" >/dev/null 2>&1; then
-    NPP_REASON="当前 NPP 头文件不包含 transpose_npp rotate 所需的 nppiRotate_8u_C1R_Ctx"
-    return 1
-  fi
-  if ! grep -R "nppiTranspose_8u_C1R_Ctx[[:space:]]*(" "$NPP_INCLUDE_DIR" >/dev/null 2>&1; then
-    NPP_REASON="当前 NPP 头文件不包含 transpose_npp 所需的 nppiTranspose_8u_C1R_Ctx"
-    return 1
-  fi
-
-  if [[ ! -d "$NPP_LIBDIR" ]]; then
-    NPP_REASON="未找到 NPP 库目录: $NPP_LIBDIR"
-    return 1
-  fi
-
-  local needed=(nppif nppig nppidei nppc)
-  local lib
-  for lib in "${needed[@]}"; do
-    if ! npp_has_library "$lib"; then
-      NPP_REASON="未找到 MinGW 可用的 Windows NPP 导入/静态库: lib${lib}.a、lib${lib}.dll.a 或 ${lib}.lib（目录: $NPP_LIBDIR）"
-      return 1
-    fi
-  done
-
-  NPP_STATUS="enabled"
-  NPP_REASON="NPP 13 头文件和 Windows x64 导入库已找到: include=$NPP_INCLUDE_DIR lib=$NPP_LIBDIR"
-  return 0
-}
 
 stage_src() {
   local name="$1"
@@ -476,12 +409,13 @@ ar = '$AR'
 strip = '$STRIP'
 windres = '$WINDRES'
 pkg-config = '$PKG_CONFIG'
+cuda = '$NVCC'
 
 [built-in options]
-c_args = $(meson_quote_array "$CFLAGS")
-cpp_args = $(meson_quote_array "$CXXFLAGS")
-c_link_args = $(meson_quote_array "$LDFLAGS")
-cpp_link_args = $(meson_quote_array "$LDFLAGS")
+c_args = $(meson_quote_array "$CFLAGS -I$PREFIX/include")
+cpp_args = $(meson_quote_array "$CXXFLAGS -I$PREFIX/include")
+c_link_args = $(meson_quote_array "$LDFLAGS -L$PREFIX/lib")
+cpp_link_args = $(meson_quote_array "$LDFLAGS -L$PREFIX/lib")
 optimization = '2'
 b_lto = $meson_lto
 
@@ -593,7 +527,7 @@ validate_ffmpeg_configuration() {
   grep -q '^CONFIG_AV1_NVENC_ENCODER=yes$' "$config_mak" || { echo "异常：av1_nvenc 未启用"; exit 1; }
   grep -q '^CONFIG_LIBFDK_AAC_ENCODER=yes$' "$config_mak" || { echo "异常：libfdk_aac encoder 未启用"; exit 1; }
 
-  local allowed='CONFIG_(HEVC_NVENC|AV1_NVENC|LIBFDK_AAC)_ENCODER=yes|CONFIG_FRAME_THREAD_ENCODER=yes'
+  local allowed='CONFIG_(HEVC_NVENC|AV1_NVENC|LIBFDK_AAC|AAC_AT|WRAPPED_AVFRAME)_ENCODER=yes|CONFIG_FRAME_THREAD_ENCODER=yes'
   local unexpected
   unexpected="$(grep -E '^CONFIG_.*_ENCODER=yes$' "$config_mak" | grep -Ev "$allowed" || true)"
   if [[ -n "$unexpected" ]]; then
@@ -608,31 +542,47 @@ validate_ffmpeg_configuration() {
     exit 1
   fi
 
-  local f macro
-  if [[ "$CUDA_ENABLE" == "1" ]]; then
-    grep -q '^CONFIG_CUDA_NVCC=yes$' "$config_mak" || { echo "异常：cuda-nvcc 未启用"; exit 1; }
-    for f in "${CUDA_FILTERS[@]}"; do
-      macro="CONFIG_$(printf '%s' "$f" | tr '[:lower:]' '[:upper:]')_FILTER"
-      grep -q "^${macro}=yes$" "$config_mak" || {
-        echo "异常：CUDA 滤镜未启用: $f"
-        grep -E 'CONFIG_.*(CUDA|NPP).*_FILTER' "$config_mak" || true
-        exit 1
-      }
-    done
+  # 验证只能启用白名单中的滤镜，且不应启用任何 NPP 滤镜和 libnpp 依赖
+  if grep -q '^CONFIG_LIBNPP=yes$' "$config_mak"; then
+    echo "异常：libnpp 不应启用"
+    exit 1
   fi
 
-  if [[ "$NPP_STATUS" == "enabled" ]]; then
-    grep -q '^CONFIG_LIBNPP=yes$' "$config_mak" || { echo "异常：libnpp 未启用"; exit 1; }
-    for f in "${NPP_COMPLEMENT_FILTERS[@]}"; do
-      macro="CONFIG_$(printf '%s' "$f" | tr '[:lower:]' '[:upper:]')_FILTER"
-      grep -q "^${macro}=yes$" "$config_mak" || { echo "异常：NPP 补充滤镜未启用: $f"; exit 1; }
-    done
-    for f in "${NPP_DUPLICATE_FILTERS[@]}"; do
-      macro="CONFIG_$(printf '%s' "$f" | tr '[:lower:]' '[:upper:]')_FILTER"
-      if grep -q "^${macro}=yes$" "$config_mak"; then
-        echo "异常：与 CUDA 重复的 NPP 滤镜被启用: $f"
+  # 检查所有启用的滤镜
+  local filter_line
+  while read -r filter_line; do
+    if [[ "$filter_line" =~ ^CONFIG_([A-Za-z0-9_]+)_FILTER=yes$ ]]; then
+      local filter_name="${BASH_REMATCH[1]}"
+      local filter_lower
+      filter_lower="$(printf '%s' "$filter_name" | tr '[:upper:]' '[:lower:]')"
+      
+      # 检查是否在 ALLOWED_FILTERS 白名单中
+      local found=0
+      local allowed
+      for allowed in "${ALLOWED_FILTERS[@]}"; do
+        if [[ "$allowed" == "$filter_lower" ]]; then
+          found=1
+          break
+        fi
+      done
+      
+      if [[ "$found" -eq 0 ]]; then
+        echo "异常：启用了未在白名单中的滤镜: $filter_lower (CONFIG_${filter_name}_FILTER)"
         exit 1
       fi
+    fi
+  done < "$config_mak"
+
+  # 如果 CUDA_ENABLE=1，还需确保 CUDA 优先滤镜确实已启用 (若 ffmpeg configure 没报错的话)
+  if [[ "$CUDA_ENABLE" == "1" ]]; then
+    grep -q '^CONFIG_CUDA_NVCC=yes$' "$config_mak" || { echo "异常：cuda-nvcc 未启用"; exit 1; }
+    local cuda_f
+    for cuda_f in scale_cuda overlay_cuda pad_cuda colorspace_cuda yadif_cuda bwdif_cuda bilateral_cuda chromakey_cuda thumbnail_cuda hwupload_cuda hwdownload hwmap; do
+      local macro="CONFIG_$(printf '%s' "$cuda_f" | tr '[:lower:]' '[:upper:]')_FILTER"
+      grep -q "^${macro}=yes$" "$config_mak" || {
+        echo "异常：CUDA 优先滤镜未启用: $cuda_f"
+        exit 1
+      }
     done
   fi
 
@@ -641,6 +591,23 @@ validate_ffmpeg_configuration() {
     grep 'FFMPEG_LICENSE' "$config_h" || true
     exit 1
   }
+
+  # 验证字幕相关组件均已禁用
+  local disabled_components=(
+    CONFIG_LIBASS CONFIG_LIBFREETYPE CONFIG_LIBFONTCONFIG CONFIG_LIBFRIBIDI CONFIG_LIBHARFBUZZ
+    CONFIG_SUBTITLES_FILTER CONFIG_ASS_FILTER CONFIG_DRAWTEXT_FILTER
+    CONFIG_ASS_DECODER CONFIG_SRT_DECODER CONFIG_SUBRIP_DECODER CONFIG_WEBVTT_DECODER
+    CONFIG_MOVTEXT_DECODER CONFIG_DVBSUB_DECODER CONFIG_DVDSUB_DECODER CONFIG_PGSSUB_DECODER
+    CONFIG_ASS_ENCODER CONFIG_SRT_ENCODER CONFIG_SUBRIP_ENCODER CONFIG_WEBVTT_ENCODER
+    CONFIG_MOVTEXT_ENCODER CONFIG_DVBSUB_ENCODER CONFIG_DVDSUB_ENCODER
+  )
+  local comp
+  for comp in "${disabled_components[@]}"; do
+    if grep -q "^${comp}=yes$" "$config_mak"; then
+      echo "异常：不应启用的字幕相关组件被启用: $comp"
+      exit 1
+    fi
+  done
 }
 
 run_stage() {
@@ -665,90 +632,51 @@ run_stage() {
       build_autotools fdk-aac
       ;;
 
+    AudioToolboxWrapper)
+      if [[ "$AAC_AT_ENABLE" != "1" ]]; then
+        echo "AudioToolboxWrapper (aac_at) is disabled via AAC_AT_ENABLE"
+      else
+        local atw_stage
+        atw_stage="$(stage_src "AudioToolboxWrapper")"
+        local bld="$BUILDROOT/AudioToolboxWrapper"
+        rm -rf "$bld"
+        cmake -S "$atw_stage" -B "$bld" -G Ninja \
+          -DCMAKE_SYSTEM_NAME=Windows \
+          -DCMAKE_SYSTEM_PROCESSOR=x86_64 \
+          -DCMAKE_C_COMPILER="$CC" \
+          -DCMAKE_BUILD_TYPE=Release \
+          -DCMAKE_C_FLAGS_RELEASE="$CFLAGS" \
+          -DCMAKE_INSTALL_PREFIX="$PREFIX" \
+          -DCMAKE_PREFIX_PATH="$PREFIX" \
+          -DBUILD_SHARED_LIBS=OFF
+        cmake --build "$bld" --parallel "$JOBS"
+        
+        mkdir -p "$PREFIX/lib" "$PREFIX/include"
+        cp -f "$bld/libAudioToolboxWrapper.a" "$PREFIX/lib/"
+        cp -rf "$atw_stage/include/"* "$PREFIX/include/"
+      fi
+      ;;
+
     zimg)
       build_autotools zimg
       ;;
 
-    freetype)
-      build_cmake freetype \
-        -DFT_DISABLE_ZLIB=TRUE \
-        -DFT_DISABLE_BZIP2=TRUE \
-        -DFT_DISABLE_PNG=TRUE \
-        -DFT_DISABLE_BROTLI=TRUE \
-        -DFT_DISABLE_HARFBUZZ=TRUE
-      ;;
 
-    harfbuzz)
-      build_meson harfbuzz \
-        -Ddocs=disabled \
-        -Dtests=disabled \
-        -Dbenchmark=disabled \
-        -Dutilities=disabled \
-        -Dglib=disabled \
-        -Dgobject=disabled \
-        -Dcairo=disabled \
-        -Dicu=disabled \
-        -Dintrospection=disabled \
-        -Dfreetype=enabled
-      ;;
 
-    fribidi)
-      build_meson fribidi \
-        -Ddocs=false \
-        -Dbin=false \
-        -Dtests=false
-      ;;
-
-    expat)
-      local expat_stage
-      local expat_ipo=OFF
-      [[ "$LTO_ENABLE" == "1" ]] && expat_ipo=ON
-      expat_stage="$(stage_src "expat")"
-      rm -rf "$BUILDROOT/expat"
-      cmake -S "$expat_stage/expat" -B "$BUILDROOT/expat" -G Ninja \
-        -DCMAKE_SYSTEM_NAME=Windows \
-        -DCMAKE_SYSTEM_PROCESSOR=x86_64 \
-        -DCMAKE_C_COMPILER="$CC" \
-        -DCMAKE_CXX_COMPILER="$CXX" \
-        -DCMAKE_RC_COMPILER="$WINDRES" \
-        -DCMAKE_AR="$AR" \
-        -DCMAKE_RANLIB="$RANLIB" \
-        -DCMAKE_BUILD_TYPE=Release \
-        -DCMAKE_C_FLAGS_RELEASE="$CFLAGS" \
-        -DCMAKE_CXX_FLAGS_RELEASE="$CXXFLAGS" \
-        -DCMAKE_EXE_LINKER_FLAGS="$LDFLAGS" \
-        -DCMAKE_SHARED_LINKER_FLAGS="$LDFLAGS" \
-        -DCMAKE_MODULE_LINKER_FLAGS="$LDFLAGS" \
-        -DCMAKE_INTERPROCEDURAL_OPTIMIZATION="$expat_ipo" \
-        -DCMAKE_INSTALL_PREFIX="$PREFIX" \
-        -DCMAKE_PREFIX_PATH="$PREFIX" \
-        -DCMAKE_FIND_ROOT_PATH="$PREFIX" \
-        -DBUILD_SHARED_LIBS=OFF \
-        -DEXPAT_BUILD_DOCS=OFF \
-        -DEXPAT_BUILD_EXAMPLES=OFF \
-        -DEXPAT_BUILD_TESTS=OFF \
-        -DEXPAT_BUILD_TOOLS=OFF
-      cmake --build "$BUILDROOT/expat" --parallel "$JOBS"
-      cmake --install "$BUILDROOT/expat"
-      ;;
-
-    fontconfig)
-      build_meson fontconfig \
-        -Ddoc=disabled \
-        -Dnls=disabled \
-        -Dtests=disabled \
-        -Dtools=disabled
-      ;;
-
-    libass)
-      build_autotools libass
-      PKG_CONFIG_LIBDIR="$PREFIX/lib/pkgconfig" "$PKG_CONFIG" --exists 'libass >= 0.11.0' || {
-        echo "pkg-config 无法识别交叉编译版 libass"
-        exit 1
-      }
+    dav1d)
+      build_meson dav1d \
+        -Denable_tools=false \
+        -Denable_tests=false \
+        -Denable_examples=false \
+        -Denable_asm=true
       ;;
 
     ffmpeg)
+      # Reset configure file to start from a clean slate
+      git -C "$ROOT/ffmpeg-source" checkout configure || true
+      # Patch configure to use -fatbin instead of -ptx for NVCC compilation to support multiple GPU architectures
+      sed -i 's/nvccflags="$nvccflags -ptx"/nvccflags="$nvccflags -fatbin"/g' "$ROOT/ffmpeg-source/configure"
+
       local ff_bld="$BUILDROOT/ffmpeg"
       rm -rf "$ff_bld"
       mkdir -p "$ff_bld"
@@ -760,21 +688,21 @@ run_stage() {
         exit 1
       }
       PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig" "$PKG_CONFIG" --exists fdk-aac || {
-        echo "缺少 fdk-aac，请先运行: ./build.sh --fdkaac"
+        echo "缺少 fdk-aac，请先运行: ./build.sh --fdk-aac"
+        exit 1
+      }
+      PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig" "$PKG_CONFIG" --exists dav1d || {
+        echo "缺少 dav1d，请先运行: ./build.sh --dav1d"
         exit 1
       }
 
       local extra_cflags="-I$PREFIX/include"
       local extra_ldflags="-L$PREFIX/lib -static -static-libgcc -static-libstdc++ $LDFLAGS"
-      local extra_libs="-lstdc++ -lwinpthread"
+      local extra_libs="-lstdc++ -lwinpthread -lgcc"
       local cuda_flags=()
-      local npp_flags=()
-      local filter_flags=()
+      local filter_flags=(--disable-filters)
       local f
 
-      for f in "${CUDA_FILTERS[@]}"; do
-        require_config_item --list-filters "$f"
-      done
       require_config_item --list-encoders hevc_nvenc
       require_config_item --list-encoders av1_nvenc
       require_config_item --list-encoders libfdk_aac
@@ -789,29 +717,6 @@ run_stage() {
           --nvcc="$NVCC"
           --nvccflags="$(make_nvccflags)"
         )
-        for f in "${CUDA_FILTERS[@]}"; do
-          filter_flags+=(--enable-filter="$f")
-        done
-      fi
-
-      if npp_preflight; then
-        for f in "${NPP_COMPLEMENT_FILTERS[@]}"; do
-          require_config_item --list-filters "$f"
-          filter_flags+=(--enable-filter="$f")
-        done
-        for f in "${NPP_DUPLICATE_FILTERS[@]}"; do
-          filter_flags+=(--disable-filter="$f")
-        done
-        extra_cflags+=" -I$CUDA_HOME/include -I$NPP_INCLUDE_DIR"
-        extra_ldflags+=" -L$NPP_LIBDIR"
-        extra_libs+=" -lnppif -lnppig -lnppidei -lnppc"
-        npp_flags=(--enable-libnpp)
-      else
-        if [[ "$NPP_ENABLE" == "1" ]]; then
-          echo "NPP 强制启用失败: $NPP_REASON"
-          exit 1
-        fi
-        echo "NPP 自动跳过: $NPP_REASON"
       fi
 
       local lto_flags=()
@@ -819,6 +724,7 @@ run_stage() {
         lto_flags=(--enable-lto=auto)
       fi
 
+      SKIPPED_ITEMS=()
       local configure_cmd=(
         "$ROOT/ffmpeg-source/configure"
         --prefix="$PREFIX"
@@ -827,6 +733,12 @@ run_stage() {
         --target-os=mingw32
         --cross-prefix="$TARGET-"
         --enable-cross-compile
+        --cc="$CC"
+        --cxx="$CXX"
+        --ld="$CXX"
+        --ar="$AR"
+        --nm="$NM"
+        --ranlib="$RANLIB"
         --pkg-config="$PKG_CONFIG"
         --pkg-config-flags=--static
         --optflags="$CFLAGS"
@@ -845,24 +757,129 @@ run_stage() {
         --disable-ffprobe
         --enable-ffmpeg
         --enable-ffnvcodec
+        --disable-libass
+        --disable-libfreetype
+        --disable-libfontconfig
+        --disable-libfribidi
+        --disable-libharfbuzz
         "${lto_flags[@]}"
         "${cuda_flags[@]}"
-        "${npp_flags[@]}"
         "${filter_flags[@]}"
         --enable-nvenc
         --enable-nvdec
-        --disable-encoders
-        --enable-encoder=hevc_nvenc
-        --enable-encoder=av1_nvenc
-        --enable-encoder=libfdk_aac
+        --disable-cuvid
         --enable-libfdk-aac
-        --enable-libass
-        --enable-libfreetype
-        --enable-libharfbuzz
-        --enable-libfontconfig
-        --enable-libfribidi
         --enable-libzimg
+        --enable-libdav1d
       )
+
+      add_if_exists() {
+        local list_cmd="$1"
+        local name="$2"
+        local enable_flag="$3"
+        if have_config_item "$list_cmd" "$name"; then
+          configure_cmd+=("$enable_flag=$name")
+        else
+          SKIPPED_ITEMS+=("$name ($list_cmd)")
+          echo "WARNING: $name is not supported by FFmpeg ($list_cmd), skipping."
+        fi
+      }
+
+      # 编码器白名单 (仅允许指定的音视频编码器，无任何图片编码器)
+      configure_cmd+=(--disable-encoders)
+      add_if_exists --list-encoders hevc_nvenc --enable-encoder
+      add_if_exists --list-encoders av1_nvenc --enable-encoder
+      add_if_exists --list-encoders libfdk_aac --enable-encoder
+      add_if_exists --list-encoders wrapped_avframe --enable-encoder
+      if [[ "$AAC_AT_ENABLE" == "1" ]]; then
+        # 修改 configure 脚本使 MinGW 链接 AudioToolboxWrapper
+        sed -i 's/enabled audiotoolbox && check_apple_framework AudioToolbox/enabled audiotoolbox \&\& \{ check_apple_framework AudioToolbox || check_lib audiotoolbox "AudioToolbox\/AudioToolbox.h" AudioFormatGetProperty -lAudioToolboxWrapper; \}/g' "$ROOT/ffmpeg-source/configure"
+        sed -i 's/check_type AudioToolbox\/AudioToolbox.h AudioObjectPropertyAddress/check_type AudioToolbox\/AudioToolbox.h AudioObjectPropertyAddress || true/g' "$ROOT/ffmpeg-source/configure"
+        add_if_exists --list-encoders aac_at --enable-encoder
+        configure_cmd+=(--enable-audiotoolbox)
+      fi
+
+      # 解码器白名单
+      configure_cmd+=(--disable-decoders)
+      local video_decoders=(
+        h264 hevc av1 vp9 vp8 mpeg2video mpeg4 msmpeg4v3 vc1 wmv3 prores dnxhd cfhd mjpeg jpeg2000 png webp bmp tiff gif rawvideo wrapped_avframe libdav1d
+      )
+      local audio_decoders=(
+        aac mp3 ac3 eac3 truehd dca flac opus vorbis wavpack alac pcm_s16le pcm_s24le pcm_s32le pcm_f32le pcm_f64le
+      )
+      local old_decoders=(
+        indeo2 indeo3 indeo4 indeo5 cinepak rv10 rv20 h261 h263 h263i flv svq1 svq3 binkvideo cineform
+      )
+
+      local dec
+      for dec in "${video_decoders[@]}" "${audio_decoders[@]}" "${old_decoders[@]}"; do
+        if [[ " ${old_decoders[*]} " =~ " ${dec} " ]]; then
+          SKIPPED_ITEMS+=("$dec (explicitly excluded/obsolete)")
+          continue
+        fi
+        add_if_exists --list-decoders "$dec" --enable-decoder
+      done
+
+      # 硬件加速器白名单
+      configure_cmd+=(--disable-hwaccels)
+      local hwaccels=(
+        h264_nvdec hevc_nvdec av1_nvdec vp8_nvdec vp9_nvdec mpeg2_nvdec vc1_nvdec mjpeg_nvdec
+      )
+      local hw
+      for hw in "${hwaccels[@]}"; do
+        add_if_exists --list-hwaccels "$hw" --enable-hwaccel
+      done
+
+      # 解复用器 (Demuxers) 白名单
+      configure_cmd+=(--disable-demuxers)
+      local demuxers=(
+        matroska mov mpegts h264 hevc av1 rawvideo image2 concat aac mp3 flac ogg wav
+      )
+      local dem
+      for dem in "${demuxers[@]}"; do
+        add_if_exists --list-demuxers "$dem" --enable-demuxer
+      done
+
+      # 复用器 (Muxers) 白名单
+      configure_cmd+=(--disable-muxers)
+      local muxers=(
+        matroska mp4 mpegts null rawvideo image2 adts flac ogg wav
+      )
+      local mux
+      for mux in "${muxers[@]}"; do
+        add_if_exists --list-muxers "$mux" --enable-muxer
+      done
+
+      # 解析器 (Parsers) 白名单
+      configure_cmd+=(--disable-parsers)
+      local parsers=(
+        h264 hevc av1 aac mp3 opus vorbis
+      )
+      local parser
+      for parser in "${parsers[@]}"; do
+        add_if_exists --list-parsers "$parser" --enable-parser
+      done
+
+      # 比特流过滤器 (BSF) 白名单
+      configure_cmd+=(--disable-bsfs)
+      local bsfs=(
+        h264_mp4toannexb hevc_mp4toannexb av1_metadata h264_metadata hevc_metadata aac_adtstoasc extract_extradata
+      )
+      local bsf
+      for bsf in "${bsfs[@]}"; do
+        add_if_exists --list-bsfs "$bsf" --enable-bsf
+      done
+      # 滤镜白名单化：只逐项启用必要滤镜
+      for f in "${ALLOWED_FILTERS[@]}"; do
+        # 如果禁用 CUDA，跳过 *_cuda 滤镜和 hwupload_cuda
+        if [[ "$CUDA_ENABLE" != "1" ]]; then
+          if [[ "$f" == *_cuda || "$f" == hwupload_cuda ]]; then
+            echo "CUDA_ENABLE=0, skipping filter: $f"
+            continue
+          fi
+        fi
+        add_if_exists --list-filters "$f" --enable-filter
+      done
 
       printf '%s\n' "${configure_cmd[@]}" > "$BUILDROOT/ffmpeg-configure.args"
       echo "===== FFmpeg configure 命令 ====="
@@ -873,12 +890,13 @@ run_stage() {
       validate_ffmpeg_configuration ffbuild/config.mak config.h
 
       echo "===== 已启用的目标编码器 ====="
-      grep -E '^CONFIG_(HEVC_NVENC|AV1_NVENC|LIBFDK_AAC)_ENCODER=yes$' ffbuild/config.mak
-      echo "===== CUDA/NPP 滤镜状态 ====="
-      grep -E '^CONFIG_.*(CUDA|NPP).*_FILTER=' ffbuild/config.mak || true
-      echo "===== NPP 状态 ====="
-      echo "NPP_STATUS=$NPP_STATUS"
-      echo "NPP_REASON=$NPP_REASON"
+      grep -E '^CONFIG_(HEVC_NVENC|AV1_NVENC|LIBFDK_AAC|AAC_AT)_ENCODER=yes$' ffbuild/config.mak || true
+      echo "===== CUDA 滤镜状态 ====="
+      grep -E '^CONFIG_.*CUDA.*_FILTER=' ffbuild/config.mak || true
+      if [[ ${#SKIPPED_ITEMS[@]} -gt 0 ]]; then
+        echo "===== 编译跳过/未支持组件 ====="
+        printf ' - %s\n' "${SKIPPED_ITEMS[@]}"
+      fi
 
       test -s Makefile || { echo "异常：构建目录未生成 Makefile"; exit 1; }
       make -f ./Makefile -j"$FFMPEG_JOBS"
@@ -888,6 +906,14 @@ run_stage() {
       test -f "$PREFIX/bin/ffmpeg.exe" || { echo "异常：未生成 $PREFIX/bin/ffmpeg.exe"; exit 1; }
       "$STRIP" "$PREFIX/bin/ffmpeg.exe" || true
       cp -f "$PREFIX/bin/ffmpeg.exe" "$ROOT/ffmpeg.exe"
+
+      # 复制到 D:/ (WSL 下为 /mnt/d/)
+      if [[ -d "/mnt/d" ]]; then
+        echo "Copying ffmpeg.exe to /mnt/d/ffmpeg.exe..."
+        cp -f "$PREFIX/bin/ffmpeg.exe" "/mnt/d/ffmpeg.exe"
+      else
+        echo "WARNING: /mnt/d/ does not exist. Cannot copy to D:/ffmpeg.exe."
+      fi
       ;;
 
     *)
@@ -918,15 +944,17 @@ CXX="$(canonical_tool "${CXX:-${TARGET}-g++-posix}")"
 if [[ "$LTO_ENABLE" == "1" ]]; then
   AR="$(canonical_first_tool "${TARGET}-gcc-ar-posix" "${TARGET}-gcc-ar")"
   RANLIB="$(canonical_first_tool "${TARGET}-gcc-ranlib-posix" "${TARGET}-gcc-ranlib")"
+  NM="$(canonical_first_tool "${TARGET}-gcc-nm-posix" "${TARGET}-gcc-nm")"
 else
   AR="$(canonical_tool "${AR:-${TARGET}-ar}")"
   RANLIB="$(canonical_tool "${RANLIB:-${TARGET}-ranlib}")"
+  NM="$(canonical_tool "${NM:-${TARGET}-nm}")"
 fi
 STRIP="$(canonical_tool "${STRIP:-${TARGET}-strip}")"
 WINDRES="$(canonical_tool "${WINDRES:-${TARGET}-windres}")"
 PKG_CONFIG="$(canonical_tool "${PKG_CONFIG:-pkg-config}")"
 
-export CC CXX AR RANLIB STRIP WINDRES PKG_CONFIG CUDA_HOME CUDA_ENABLE
+export CC CXX AR NM RANLIB STRIP WINDRES PKG_CONFIG CUDA_HOME CUDA_ENABLE
 export PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig"
 export PKG_CONFIG_LIBDIR="$PREFIX/lib/pkgconfig"
 
@@ -939,7 +967,7 @@ if [[ "$FULL_BUILD" -eq 1 ]]; then
   rm -rf "$PREFIX/include" "$PREFIX/lib" "$PREFIX/share" "$PREFIX/bin"
 fi
 
-for repo in nv-codec-headers fdk-aac zimg freetype harfbuzz fribidi expat fontconfig libass ffmpeg-source; do
+for repo in nv-codec-headers fdk-aac zimg ffmpeg-source AudioToolboxWrapper dav1d; do
   need_repo "$repo"
 done
 
@@ -969,6 +997,4 @@ echo "============================================================"
 echo "构建完成"
 echo "最终输出: $ROOT/ffmpeg.exe"
 echo "FFmpeg configure 参数记录: $BUILDROOT/ffmpeg-configure.args"
-echo "NPP_STATUS=$NPP_STATUS"
-echo "NPP_REASON=$NPP_REASON"
 echo "============================================================"
