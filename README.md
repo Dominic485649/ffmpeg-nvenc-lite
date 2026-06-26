@@ -8,6 +8,8 @@
 
 目标不是做“全功能 FFmpeg”，而是构建一个体积更小、组件更少、路径更明确的 GPU 转码版 `ffmpeg.exe`。
 
+### 如果需要intel的qsv硬编解码器支持，请看[ffmpeg-qsv-lite](https://github.com/Dominic485649/ffmpeg-qsv-lite)
+
 ---
 
 ## 设计目标
