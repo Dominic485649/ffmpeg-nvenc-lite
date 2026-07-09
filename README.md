@@ -13,15 +13,8 @@
 ## 特性概览
 
 * Windows x64 目标产物：`ffmpeg.exe`
-* Linux / WSL2 → MinGW-w64 交叉编译
+* Linux / WSL2 → Clang 交叉编译
 * 默认启用 CUDA / NVENC / NVDEC
-* 默认使用 CUDA 13.3 工具链路径
-* 静态链接 FFmpeg 与依赖库
-* 白名单化 encoder / decoder / muxer / demuxer / filter
-* 默认禁用 `ffprobe`、`ffplay`、文档、调试信息
-* 默认启用 LTO、section GC、x86-64-v3 CPU baseline
-* 构建完成后复制 `ffmpeg.exe` 到当前 `nvenc` 目录
-* 如果检测到 `/mnt/d`，额外复制到 `/mnt/d/ffmpeg.exe`
 
 ---
 
@@ -43,40 +36,10 @@
 
 如果你需要完整 FFmpeg 功能，请使用全功能构建；如果你需要 Intel QSV 专用版本，请使用对应的 QSV Lite 项目。
 
----
-
-## 当前构建定位
-
-| 项目               | 配置                                                          |
-| ---------------- | ----------------------------------------------------------- |
-| Target           | Windows x86_64                                              |
-| Toolchain        | Linux / WSL2 → MinGW-w64                                    |
-| FFmpeg source    | 默认跟踪 `FFMPEG_REF=master`，可自行指定 tag / branch / commit        |
-| CUDA             | 默认启用                                                        |
-| CUDA redist 默认路径 | `toolchains/cuda-redist-13.3.0/install/linux`               |
-| GPU fatbin 架构    | `sm_75`, `sm_80`, `sm_86`, `sm_89`, `sm_120`, `compute_120` |
-| CPU baseline     | `x86-64-v3`                                                 |
-| Link             | Static                                                      |
-| License state    | `nonfree and unredistributable`                             |
-| ffmpeg           | 启用                                                          |
-| ffprobe          | 默认禁用                                                        |
-| ffplay           | 默认禁用                                                        |
-
-如果要固定 FFmpeg 版本，请显式指定：
-
-```bash
-FFMPEG_REF=n8.1.2 ./ffmpeg.sh update
-./ffmpeg.sh build
-```
-
-或者指定某个 commit：
-
-```bash
-FFMPEG_REF=<commit-hash> ./ffmpeg.sh update
-./ffmpeg.sh build
-```
+[全功能ffmpeg，点击此处跳转](https://github.com/Dominic485649/ffmpeg-full)  [qsv专属版本，点击此处跳转](https://github.com/Dominic485649/ffmpeg-qsv-lite)
 
 ---
+
 
 ## 编码器白名单
 
@@ -86,15 +49,7 @@ FFMPEG_REF=<commit-hash> ./ffmpeg.sh update
 | ----------------- | ------- | --------------------------------- |
 | `hevc_nvenc`      | 视频      | H.265 / HEVC NVENC 硬件编码           |
 | `av1_nvenc`       | 视频      | AV1 NVENC 硬件编码                    |
-| `aac`             | 音频      | FFmpeg 内置 AAC 编码器                 |
-
-说明：
-
-* 软件视频编码器默认全部禁用。
-* `libfdk_aac` 不启用。
-* `aac_at` 不启用。
-* `libsvtav1` / `libx264` / `libx265` 不启用。
-* 如果你的 GPU 不支持 AV1 NVENC，请使用 `hevc_nvenc`。
+| `aac`             | 音频      | FFmpeg 内置 NMRAAC 编码器                 |
 
 ---
 
@@ -113,16 +68,6 @@ prores, dnxhd, cfhd,
 mjpeg, jpeg2000, png, webp, bmp, tiff, gif,
 rawvideo, wrapped_avframe,
 libdav1d
-```
-
-明确排除部分老旧 / 非目标解码器：
-
-```text
-indeo2, indeo3, indeo4, indeo5,
-cinepak, rv10, rv20,
-h261, h263, h263i,
-flv, svq1, svq3,
-binkvideo, cineform
 ```
 
 ### 音频解码器
@@ -223,10 +168,6 @@ setparams, setsar,
 aresample,
 transpose, crop, hflip, vflip, rotate
 ```
-
-这些 CPU 滤镜主要用于基础兼容、简单几何处理和滤镜链衔接。
-如果你追求更极限的 GPU-only 构建，可以继续从脚本白名单中移除 CPU 几何滤镜。
-
 ---
 
 ## 容器 / 封装支持
@@ -314,32 +255,6 @@ zimg
 dav1d
 vapoursynth
 ffmpeg
-```
-
----
-
-## 构建环境
-
-推荐环境：
-
-* Windows 10 / 11 x64
-* WSL2 Ubuntu 22.04 / 24.04
-* NVIDIA 显卡与较新的 NVIDIA 驱动
-* MinGW-w64
-* CUDA Toolkit for WSL
-* 支持 x86-64-v3 的 CPU
-
-脚本的 `tool` 阶段会安装常用构建依赖：
-
-```text
-build-essential, autoconf, automake, libtool, make,
-cmake, meson, ninja-build,
-pkg-config, nasm, yasm,
-git, curl, ca-certificates,
-python3, gettext, gperf,
-mingw-w64, mingw-w64-tools,
-binutils-mingw-w64-x86-64,
-gcc/g++ mingw-w64 posix toolchain
 ```
 
 ---
@@ -589,32 +504,6 @@ nvenc/ffmpeg.exe
 ```text
 D:\ffmpeg.exe
 ```
-
----
-
-## 适用场景
-
-适合：
-
-* NVIDIA 显卡用户
-* HEVC / AV1 NVENC 转码
-* CUDA 缩放
-* CUDA 反交错
-* CUDA 基础降噪
-* GUI / 脚本内部调用的轻量专用 `ffmpeg.exe`
-* 不需要完整 FFmpeg 生态的专用压制流程
-
-不适合：
-
-* 字幕烧录
-* 质量评测
-* 全格式考古解码
-* 全量图片编码
-* 软件编码器压制
-* 完整 FFmpeg CLI 学习环境
-* 依赖 `ffprobe` 的工具链
-* 依赖 `libfdk_aac` / `aac_at` 的音频压制流程
-* 需要 NPP 滤镜的处理流程
 
 ---
 
