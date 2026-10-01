@@ -22,6 +22,7 @@ JOBS="${JOBS:-$(nproc)}"
 FFMPEG_JOBS="${FFMPEG_JOBS:-$JOBS}"
 FFMPEG_REF="${FFMPEG_REF:-master}"
 LTO_ENABLE="${LTO_ENABLE:-1}"
+CFG_ENABLE="${CFG_ENABLE:-1}"
 LTO_FLAGS="${LTO_FLAGS:--flto=thin}"
 CPU_FLAGS="${CPU_FLAGS:--march=x86-64-v3 -mtune=generic}"
 OPT_CFLAGS_BASE="${OPT_CFLAGS_BASE:--O3 -pipe -DNDEBUG -funwind-tables -fexceptions}"
@@ -41,6 +42,7 @@ declare -A URLS=(
   [opus]="https://github.com/xiph/opus.git"
   [libvpl]="https://github.com/intel/libvpl.git"
   [libsoxr]="https://github.com/chirlu/soxr.git"
+  [jxrlib]="https://github.com/scrubbbbs/jxrlib-kif.git"
   [vapoursynth]="https://github.com/vapoursynth/vapoursynth.git"
   [libshaderc]="https://github.com/google/shaderc.git"
   [vulkan-headers]="https://github.com/KhronosGroup/Vulkan-Headers.git"
@@ -53,13 +55,14 @@ declare -A TAG_REGEX=(
   [opus]='^v?[0-9]+(\.[0-9]+)*$'
   [libvpl]='^v2\.[0-9]+(\.[0-9]+)*$'
   [libsoxr]='^v?[0-9]+(\.[0-9]+)*$'
+  [jxrlib]='main|master'
   [vapoursynth]='^R[0-9]+(\.[0-9]+)*$'
   [libshaderc]='^v[0-9]+\.[0-9]+$'
   [vulkan-headers]='^v[0-9]+(\.[0-9]+)*$'
   [libplacebo]='^v[0-9]+(\.[0-9]+)*$'
 )
 
-COMMON_STAGES=(opus libsoxr libshaderc vulkan-headers libplacebo)
+COMMON_STAGES=(opus libsoxr jxrlib libshaderc vulkan-headers libplacebo)
 if [[ "$BACKEND" == "nvenc" ]]; then
   STAGES=(nv-codec-headers vapoursynth "${COMMON_STAGES[@]}" ffmpeg)
 else
@@ -324,6 +327,10 @@ setup_build_env() {
     opt+=" $LTO_FLAGS"
     ld+=" $LTO_FLAGS"
   fi
+  if [[ "$CFG_ENABLE" == "1" ]]; then
+    opt+=" -mguard=cf"
+    ld+=" -Wl,/guard:cf"
+  fi
   export CC CXX AR RANLIB STRIP WINDRES DLLTOOL PKG_CONFIG
   export CFLAGS="${CFLAGS:-$opt}"
   export CXXFLAGS="${CXXFLAGS:-$opt}"
@@ -349,6 +356,25 @@ build_cmake() {
   local name="$1" stage bld ipo=OFF
   shift
   stage="$(stage_src "$name")"
+  if [[ "$name" == "libvpl" ]]; then
+    local vpl_defs="$stage/libvpl/src/windows/mfx_dispatcher_defs.h"
+    python3 - "$vpl_defs" <<'PYVPLMINGW'
+from pathlib import Path
+import sys
+p = Path(sys.argv[1])
+s = p.read_text()
+old = "#if _MSC_VER < 1400"
+new = "#if defined(_MSC_VER) && _MSC_VER < 1400"
+old_count = s.count(old)
+new_count = s.count(new)
+if old_count == 1 and new_count == 0:
+    p.write_text(s.replace(old, new, 1))
+elif old_count == 0 and new_count == 1:
+    pass
+else:
+    raise SystemExit(f"{p}: unexpected oneVPL MinGW wcscpy_s guard state: old={old_count}, new={new_count}")
+PYVPLMINGW
+  fi
   bld="$BUILDROOT/$name"
   [[ "$LTO_ENABLE" == "1" ]] && ipo=ON
   rm -rf "$bld"
@@ -570,6 +596,464 @@ build_shaderc_from_source() {
   build_host_glslc_from_source "$stage"
 }
 
+write_jxrlib_cmake() {
+  local stage="$1"
+  cat > "$stage/CMakeLists.txt" <<'JXR_CMAKE'
+cmake_minimum_required(VERSION 3.13)
+project(jxrlib C)
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+set(JXR_INC common/include image/sys jxrgluelib jxrtestlib)
+set(JXR_SYS
+  image/sys/adapthuff.c image/sys/image.c image/sys/strcodec.c
+  image/sys/strPredQuant.c image/sys/strTransform.c image/sys/perfTimerANSI.c)
+set(JXR_DEC
+  image/decode/decode.c image/decode/postprocess.c image/decode/segdec.c
+  image/decode/strdec.c image/decode/strdec_x86.c image/decode/strInvTransform.c
+  image/decode/strPredQuantDec.c image/decode/JXRTranscode.c)
+set(JXR_ENC
+  image/encode/encode.c image/encode/segenc.c image/encode/strenc.c
+  image/encode/strenc_x86.c image/encode/strFwdTransform.c image/encode/strPredQuantEnc.c)
+set(JXR_GLUE
+  jxrgluelib/JXRGlue.c jxrgluelib/JXRMeta.c
+  jxrgluelib/JXRGluePFC.c jxrgluelib/JXRGlueJxr.c)
+set(JXR_TEST
+  jxrtestlib/JXRTest.c jxrtestlib/JXRTestBmp.c jxrtestlib/JXRTestHdr.c
+  jxrtestlib/JXRTestPnm.c jxrtestlib/JXRTestTif.c jxrtestlib/JXRTestYUV.c)
+add_library(jpegxr STATIC ${JXR_SYS} ${JXR_DEC} ${JXR_ENC})
+target_include_directories(jpegxr PRIVATE ${JXR_INC})
+target_compile_definitions(jpegxr PRIVATE __ANSI__ DISABLE_PERF_MEASUREMENT)
+add_library(jxrglue STATIC ${JXR_GLUE} ${JXR_TEST})
+target_include_directories(jxrglue PRIVATE ${JXR_INC})
+target_compile_definitions(jxrglue PRIVATE __ANSI__ DISABLE_PERF_MEASUREMENT)
+target_link_libraries(jxrglue PRIVATE jpegxr)
+install(TARGETS jpegxr jxrglue ARCHIVE DESTINATION lib)
+install(FILES
+  jxrgluelib/JXRGlue.h jxrgluelib/JXRMeta.h jxrtestlib/JXRTest.h
+  image/sys/windowsmediaphoto.h DESTINATION include/jxrlib)
+install(DIRECTORY common/include/ DESTINATION include/jxrlib FILES_MATCHING PATTERN "*.h")
+JXR_CMAKE
+}
+
+build_jxrlib() {
+  local stage bld
+  stage="$(stage_src jxrlib)"
+  python3 - "$stage/image/sys/strcodec.c" <<'PYJXRLIST'
+from pathlib import Path
+import sys
+p = Path(sys.argv[1])
+s = p.read_bytes()
+old = b"    FailIf(pWS->state.buf.cbBuf < pWS->state.buf.cbCur + cb, WMP_errBufferOverflow);\n"
+new = (b"    /* WriteWS_List allocates the next PACKETLENGTH buffer on demand in\n"
+       b"       the loop below, so rejecting a write against the already\n"
+       b"       allocated total dropped every packet after the first and\n"
+       b"       silently truncated any image larger than one packet. */\n")
+start = s.index(b"ERR WriteWS_List(")
+end = s.index(b"\n}\n", start)
+body = s[start:end]
+old_count = body.count(old)
+new_count = body.count(new)
+if old_count == 1 and new_count == 0:
+    s = s[:start] + body.replace(old, new, 1) + s[end:]
+elif old_count == 0 and new_count == 1:
+    pass
+else:
+    raise SystemExit(f"{p}: unexpected WriteWS_List capacity-check state: old={old_count}, new={new_count}")
+p.write_bytes(s)
+PYJXRLIST
+  rm -f "$stage/common/include/guiddef.h"
+  write_jxrlib_cmake "$stage"
+  bld="$BUILDROOT/jxrlib"
+  rm -rf "$bld"
+  cmake -S "$stage" -B "$bld" -G Ninja \
+    -DCMAKE_SYSTEM_NAME=Windows \
+    -DCMAKE_SYSTEM_PROCESSOR=x86_64 \
+    -DCMAKE_C_COMPILER="$CC" \
+    -DCMAKE_AR="$AR" \
+    -DCMAKE_RANLIB="$RANLIB" \
+    -DCMAKE_TRY_COMPILE_TARGET_TYPE=STATIC_LIBRARY \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_INSTALL_PREFIX="$PREFIX"
+  cmake --build "$bld" --parallel "$JOBS"
+  cmake --install "$bld"
+  mkdir -p "$PREFIX/lib/pkgconfig"
+  cat > "$PREFIX/lib/pkgconfig/libjxr.pc" <<EOF
+prefix=$PREFIX
+exec_prefix=\${prefix}
+libdir=\${exec_prefix}/lib
+includedir=\${prefix}/include/jxrlib
+
+Name: libjxr
+Description: JPEG XR reference codec library
+Version: 1.1
+Libs: -L\${libdir} -ljxrglue -ljpegxr
+Libs.private: -lm
+Cflags: -I\${includedir}
+EOF
+  PKG_CONFIG_LIBDIR="$PREFIX/lib/pkgconfig" "$PKG_CONFIG" --exists libjxr || {
+    echo "libjxr pkg-config validation failed" >&2
+    exit 1
+  }
+}
+
+patch_ffmpeg_jxr() {
+  local ff_stage="$1"
+  python3 - "$ff_stage" <<'PYJXR'
+from pathlib import Path
+import sys
+root = Path(sys.argv[1])
+
+def replace_once(rel, old, new):
+    path = root / rel
+    text = path.read_text()
+    old = old.replace(r"\n", "\n")
+    new = new.replace(r"\n", "\n")
+    count = text.count(old)
+    if count != 1:
+        raise SystemExit(f"{rel}: JXR patch anchor count={count}, expected 1")
+    path.write_text(text.replace(old, new, 1))
+
+replace_once("configure",
+    "  --enable-libjxl          enable JPEG XL de/encoding via libjxl [no]\\n",
+    "  --enable-libjxl          enable JPEG XL de/encoding via libjxl [no]\\n"
+    "  --enable-libjxr          enable JPEG XR de/encoding via jxrlib [no]\\n")
+replace_once("configure", "    libjxl\\n", "    libjxl\\n    libjxr\\n")
+replace_once("configure",
+    'libjxl_encoder_deps="libjxl libjxl_threads"\\n',
+    'libjxl_encoder_deps="libjxl libjxl_threads"\\n'
+    'libjxr_decoder_deps="libjxr"\\n'
+    'libjxr_encoder_deps="libjxr"\\n')
+replace_once("configure",
+    'enabled libjxl            && require_pkg_config libjxl "libjxl >= 0.7.0" jxl/decode.h JxlDecoderVersion &&\\n'
+    '                             require_pkg_config libjxl_threads "libjxl_threads >= 0.7.0" jxl/thread_parallel_runner.h JxlThreadParallelRunner\\n',
+    'enabled libjxl            && require_pkg_config libjxl "libjxl >= 0.7.0" jxl/decode.h JxlDecoderVersion &&\\n'
+    '                             require_pkg_config libjxl_threads "libjxl_threads >= 0.7.0" jxl/thread_parallel_runner.h JxlThreadParallelRunner\\n'
+    'enabled libjxr            && require_pkg_config libjxr libjxr JXRGlue.h PKCreateCodecFactory\\n')
+replace_once("libavcodec/codec_id.h",
+    "    AV_CODEC_ID_ASTC,\\n\\n    /* various PCM \"codecs\" */\\n    AV_CODEC_ID_FIRST_AUDIO = 0x10000,     ///< A dummy id pointing at the start of audio codecs",
+    "    AV_CODEC_ID_ASTC,\\n    AV_CODEC_ID_JPEGXR = 0x7F00,\\n\\n"
+    "    /* various PCM \"codecs\" */\\n    AV_CODEC_ID_FIRST_AUDIO = 0x10000,     ///< A dummy id pointing at the start of audio codecs")
+replace_once("libavcodec/codec_desc.c",
+    '    /* various PCM "codecs" */\\n',
+    '''    {
+        .id        = AV_CODEC_ID_JPEGXR,
+        .type      = AVMEDIA_TYPE_VIDEO,
+        .name      = "jpegxr",
+        .long_name = NULL_IF_CONFIG_SMALL("JPEG XR"),
+        .props     = AV_CODEC_PROP_INTRA_ONLY | AV_CODEC_PROP_LOSSY |
+                     AV_CODEC_PROP_LOSSLESS,
+        .mime_types= MT("image/jxr", "image/vnd.ms-photo"),
+    },
+
+    /* various PCM "codecs" */
+''')
+replace_once("libavcodec/allcodecs.c",
+    "extern const FFCodec ff_libjxl_encoder;\\n",
+    "extern const FFCodec ff_libjxl_encoder;\\n"
+    "extern const FFCodec ff_libjxr_decoder;\\n"
+    "extern const FFCodec ff_libjxr_encoder;\\n")
+replace_once("libavcodec/Makefile",
+    "OBJS-$(CONFIG_LIBJXL_ENCODER)             += libjxlenc.o libjxl.o\\n",
+    "OBJS-$(CONFIG_LIBJXL_ENCODER)             += libjxlenc.o libjxl.o\\n"
+    "OBJS-$(CONFIG_LIBJXR_DECODER)             += libjxrdec.o\\n"
+    "OBJS-$(CONFIG_LIBJXR_ENCODER)             += libjxrenc.o\\n")
+replace_once("libavformat/img2.c",
+    "    TAG(JPEGXS,          jxs      )",
+    "    TAG(JPEGXR,          jxr      ) " + chr(92) + "\n"
+    "    TAG(JPEGXR,          wdp      ) " + chr(92) + "\n"
+    "    TAG(JPEGXR,          hdp      ) " + chr(92) + "\n"
+    "    TAG(JPEGXS,          jxs      )")
+replace_once("libavformat/img2enc.c",
+    '    .p.extensions   = "bmp,dpx,exr,jls,jpeg,jpg,jxs,jxl,ljpg,pam,pbm,pcx,pfm,pgm,pgmyuv,phm,"\\n',
+    '    .p.extensions   = "bmp,dpx,exr,jls,jpeg,jpg,jxs,jxl,jxr,ljpg,pam,pbm,pcx,pfm,pgm,pgmyuv,phm,"\\n')
+
+(root / "libavcodec/libjxrenc.c").write_text(r'''/*
+ * JPEG XR encoding support via jxrlib.
+ * Generated in the staged FFmpeg tree by ffmpeg.sh.
+ */
+#include <limits.h>
+#include "libavutil/pixdesc.h"
+#include "avcodec.h"
+#include "codec_internal.h"
+#include "encode.h"
+#include <JXRGlue.h>
+
+extern ERR CreateWS_List(struct WMPStream **ppWS);
+
+static int libjxr_pixfmt_to_guid(enum AVPixelFormat fmt,
+                                 PKPixelFormatGUID *guid, int *has_alpha)
+{
+    *has_alpha = 0;
+    switch (fmt) {
+    case AV_PIX_FMT_GRAY8:    *guid = GUID_PKPixelFormat8bppGray; return 0;
+    case AV_PIX_FMT_GRAY16LE: *guid = GUID_PKPixelFormat16bppGray; return 0;
+    case AV_PIX_FMT_RGB24:    *guid = GUID_PKPixelFormat24bppRGB; return 0;
+    case AV_PIX_FMT_BGR24:    *guid = GUID_PKPixelFormat24bppBGR; return 0;
+    case AV_PIX_FMT_RGBA:     *guid = GUID_PKPixelFormat32bppRGBA; *has_alpha = 1; return 0;
+    case AV_PIX_FMT_BGRA:     *guid = GUID_PKPixelFormat32bppBGRA; *has_alpha = 1; return 0;
+    case AV_PIX_FMT_RGB48LE:  *guid = GUID_PKPixelFormat48bppRGB; return 0;
+    case AV_PIX_FMT_RGBA64LE: *guid = GUID_PKPixelFormat64bppRGBA; *has_alpha = 1; return 0;
+    case AV_PIX_FMT_RGBAF16LE: *guid = GUID_PKPixelFormat64bppRGBAHalf; *has_alpha = 1; return 0;
+    case AV_PIX_FMT_RGBF16LE:  *guid = GUID_PKPixelFormat48bppRGBHalf; return 0;
+    case AV_PIX_FMT_RGBAF32LE: *guid = GUID_PKPixelFormat128bppRGBAFloat; *has_alpha = 1; return 0;
+    case AV_PIX_FMT_GRAYF16LE: *guid = GUID_PKPixelFormat16bppGrayHalf; return 0;
+    case AV_PIX_FMT_GRAYF32LE: *guid = GUID_PKPixelFormat32bppGrayFloat; return 0;
+    default: return AVERROR(EINVAL);
+    }
+}
+
+static int libjxr_encode_frame(AVCodecContext *avctx, AVPacket *pkt,
+                               const AVFrame *frame, int *got_packet)
+{
+    PKCodecFactory *factory = NULL;
+    PKImageEncode *encoder = NULL;
+    struct WMPStream *stream = NULL;
+    PKPixelFormatGUID guid;
+    CWMIStrCodecParam params = { 0 };
+    size_t output_size = 0;
+    int has_alpha = 0, ret;
+    ERR jerr = WMP_errSuccess;
+
+    if (frame->linesize[0] < 0)
+        return AVERROR(EINVAL);
+    ret = libjxr_pixfmt_to_guid(avctx->pix_fmt, &guid, &has_alpha);
+    if (ret < 0) {
+        av_log(avctx, AV_LOG_ERROR, "Unsupported JPEG XR pixel format: %s\\n",
+               av_get_pix_fmt_name(avctx->pix_fmt));
+        return ret;
+    }
+
+    params.bVerbose = FALSE;
+    params.cfColorFormat = YUV_444;
+    params.bdBitDepth = BD_LONG;
+    params.bfBitstreamFormat = FREQUENCY;
+    params.bProgressiveMode = TRUE;
+    params.olOverlap = OL_ONE;
+    params.sbSubband = SB_ALL;
+    params.uAlphaMode = has_alpha ? 2 : 0;
+    params.uiDefaultQPIndex = 1;
+    params.uiDefaultQPIndexAlpha = 1;
+
+    if ((jerr = CreateWS_List(&stream)) != WMP_errSuccess ||
+        (jerr = PKCreateCodecFactory(&factory, WMP_SDK_VERSION)) != WMP_errSuccess ||
+        (jerr = factory->CreateCodec(&IID_PKImageWmpEncode, (void **)&encoder)) != WMP_errSuccess ||
+        (jerr = encoder->Initialize(encoder, stream, &params, sizeof(params))) != WMP_errSuccess ||
+        (jerr = encoder->SetPixelFormat(encoder, guid)) != WMP_errSuccess ||
+        (jerr = encoder->SetSize(encoder, avctx->width, avctx->height)) != WMP_errSuccess ||
+        (jerr = encoder->SetResolution(encoder, 96.0f, 96.0f)) != WMP_errSuccess ||
+        (jerr = encoder->WritePixels(encoder, avctx->height, frame->data[0],
+                                     frame->linesize[0])) != WMP_errSuccess) {
+        ret = AVERROR_EXTERNAL;
+        goto fail;
+    }
+
+    if (encoder->WMP.nOffImage < 0 || encoder->WMP.nCbImage <= 0 ||
+        encoder->WMP.nOffImage > INT_MAX - encoder->WMP.nCbImage) {
+        av_log(avctx, AV_LOG_ERROR, "Invalid JPEG XR image extent\\n");
+        ret = AVERROR_INVALIDDATA;
+        goto cleanup;
+    }
+    output_size = (size_t)encoder->WMP.nOffImage + (size_t)encoder->WMP.nCbImage;
+
+    if (has_alpha && params.uAlphaMode == 2) {
+        size_t alpha_end;
+        if (encoder->WMP.nOffAlpha < 0 || encoder->WMP.nCbAlpha <= 0 ||
+            encoder->WMP.nOffAlpha > INT_MAX - encoder->WMP.nCbAlpha) {
+            av_log(avctx, AV_LOG_ERROR, "Invalid JPEG XR alpha extent\\n");
+            ret = AVERROR_INVALIDDATA;
+            goto cleanup;
+        }
+        alpha_end = (size_t)encoder->WMP.nOffAlpha + (size_t)encoder->WMP.nCbAlpha;
+        if (alpha_end > output_size)
+            output_size = alpha_end;
+    }
+
+    if (!output_size || output_size > INT_MAX ||
+        (jerr = stream->SetPos(stream, 0)) != WMP_errSuccess) {
+        ret = AVERROR_EXTERNAL;
+        goto fail;
+    }
+
+    if ((ret = ff_alloc_packet(avctx, pkt, (int)output_size)) < 0)
+        goto cleanup;
+    if ((jerr = stream->Read(stream, pkt->data, output_size)) != WMP_errSuccess) {
+        av_packet_unref(pkt);
+        ret = AVERROR_EXTERNAL;
+        goto fail;
+    }
+    *got_packet = 1;
+    ret = 0;
+    goto cleanup;
+
+fail:
+    av_log(avctx, AV_LOG_ERROR, "jxrlib JPEG XR encode failed (error=%d)\\n", (int)jerr);
+cleanup:
+    if (encoder) {
+        if (encoder->pStream)
+            stream = NULL;
+        encoder->Release(&encoder);
+    }
+    if (stream)
+        stream->Close(&stream);
+    if (factory)
+        factory->Release(&factory);
+    return ret;
+}
+
+const FFCodec ff_libjxr_encoder = {
+    .p.name = "libjxr",
+    CODEC_LONG_NAME("JPEG XR via jxrlib"),
+    .p.type = AVMEDIA_TYPE_VIDEO,
+    .p.id = AV_CODEC_ID_JPEGXR,
+    .p.capabilities = AV_CODEC_CAP_DR1 | AV_CODEC_CAP_ENCODER_REORDERED_OPAQUE,
+    FF_CODEC_ENCODE_CB(libjxr_encode_frame),
+    CODEC_PIXFMTS(AV_PIX_FMT_GRAY8, AV_PIX_FMT_GRAY16LE,
+                  AV_PIX_FMT_RGB24, AV_PIX_FMT_BGR24,
+                  AV_PIX_FMT_RGBA, AV_PIX_FMT_BGRA,
+                  AV_PIX_FMT_RGB48LE, AV_PIX_FMT_RGBA64LE,
+                  AV_PIX_FMT_RGBAF16LE, AV_PIX_FMT_RGBF16LE,
+                  AV_PIX_FMT_RGBAF32LE, AV_PIX_FMT_GRAYF16LE,
+                  AV_PIX_FMT_GRAYF32LE),
+    .p.wrapper_name = "libjxr",
+};
+''')
+
+(root / "libavcodec/libjxrdec.c").write_text(r'''/*
+ * JPEG XR decoding support via jxrlib.
+ * Generated in the staged FFmpeg tree by ffmpeg.sh.
+ */
+#include "avcodec.h"
+#include "codec_internal.h"
+#include "decode.h"
+#include <JXRGlue.h>
+
+static enum AVPixelFormat libjxr_guid_to_pixfmt(const PKPixelFormatGUID *guid,
+                                                 int *bits)
+{
+    *bits = 8;
+    if (IsEqualGUID(guid, &GUID_PKPixelFormat8bppGray)) return AV_PIX_FMT_GRAY8;
+    if (IsEqualGUID(guid, &GUID_PKPixelFormat16bppGray)) { *bits = 16; return AV_PIX_FMT_GRAY16LE; }
+    if (IsEqualGUID(guid, &GUID_PKPixelFormat24bppRGB)) return AV_PIX_FMT_RGB24;
+    if (IsEqualGUID(guid, &GUID_PKPixelFormat24bppBGR)) return AV_PIX_FMT_BGR24;
+    if (IsEqualGUID(guid, &GUID_PKPixelFormat32bppRGBA)) return AV_PIX_FMT_RGBA;
+    if (IsEqualGUID(guid, &GUID_PKPixelFormat32bppBGRA)) return AV_PIX_FMT_BGRA;
+    if (IsEqualGUID(guid, &GUID_PKPixelFormat48bppRGB)) { *bits = 16; return AV_PIX_FMT_RGB48LE; }
+    if (IsEqualGUID(guid, &GUID_PKPixelFormat64bppRGBA)) { *bits = 16; return AV_PIX_FMT_RGBA64LE; }
+    if (IsEqualGUID(guid, &GUID_PKPixelFormat64bppRGBAHalf)) { *bits = 16; return AV_PIX_FMT_RGBAF16LE; }
+    if (IsEqualGUID(guid, &GUID_PKPixelFormat48bppRGBHalf)) { *bits = 16; return AV_PIX_FMT_RGBF16LE; }
+    if (IsEqualGUID(guid, &GUID_PKPixelFormat128bppRGBAFloat)) { *bits = 32; return AV_PIX_FMT_RGBAF32LE; }
+    if (IsEqualGUID(guid, &GUID_PKPixelFormat32bppPRGBA)) return AV_PIX_FMT_RGBA;
+    if (IsEqualGUID(guid, &GUID_PKPixelFormat32bppBGR)) return AV_PIX_FMT_BGR0;
+    if (IsEqualGUID(guid, &GUID_PKPixelFormat32bppGrayFloat)) { *bits = 32; return AV_PIX_FMT_GRAYF32LE; }
+    if (IsEqualGUID(guid, &GUID_PKPixelFormat16bppGrayHalf)) { *bits = 16; return AV_PIX_FMT_GRAYF16LE; }
+    return AV_PIX_FMT_NONE;
+}
+
+static int libjxr_decode_frame(AVCodecContext *avctx, AVFrame *frame,
+                               int *got_frame, AVPacket *pkt)
+{
+    PKFactory *factory = NULL;
+    PKCodecFactory *codec_factory = NULL;
+    PKImageDecode *decoder = NULL;
+    struct WMPStream *stream = NULL;
+    PKPixelFormatGUID guid;
+    PKRect rect = { 0, 0, 0, 0 };
+    enum AVPixelFormat pix_fmt;
+    I32 width = 0, height = 0;
+    int bits = 0, ret = AVERROR_INVALIDDATA;
+    ERR jerr = WMP_errSuccess;
+
+    if (pkt->size <= 0)
+        return AVERROR_INVALIDDATA;
+    if ((jerr = PKCreateFactory(&factory, PK_SDK_VERSION)) != WMP_errSuccess ||
+        (jerr = factory->CreateStreamFromMemory(&stream, pkt->data, pkt->size)) != WMP_errSuccess ||
+        (jerr = PKCreateCodecFactory(&codec_factory, WMP_SDK_VERSION)) != WMP_errSuccess ||
+        (jerr = codec_factory->CreateCodec(&IID_PKImageWmpDecode, (void **)&decoder)) != WMP_errSuccess ||
+        (jerr = decoder->Initialize(decoder, stream)) != WMP_errSuccess ||
+        (jerr = decoder->GetSize(decoder, &width, &height)) != WMP_errSuccess ||
+        width <= 0 || height <= 0 ||
+        (jerr = decoder->GetPixelFormat(decoder, &guid)) != WMP_errSuccess)
+        goto fail;
+
+    pix_fmt = libjxr_guid_to_pixfmt(&guid, &bits);
+    if (pix_fmt == AV_PIX_FMT_NONE) {
+        av_log(avctx, AV_LOG_ERROR, "Unsupported JPEG XR pixel format GUID\\n");
+        ret = AVERROR(ENOSYS);
+        goto cleanup;
+    }
+    if ((ret = ff_set_dimensions(avctx, width, height)) < 0)
+        goto cleanup;
+    avctx->pix_fmt = pix_fmt;
+    avctx->bits_per_raw_sample = bits;
+    if ((ret = ff_get_buffer(avctx, frame, 0)) < 0)
+        goto cleanup;
+
+    rect.Width = width;
+    rect.Height = height;
+    if ((jerr = decoder->Copy(decoder, &rect, frame->data[0],
+                              frame->linesize[0])) != WMP_errSuccess)
+        goto fail;
+    *got_frame = 1;
+    ret = pkt->size;
+    goto cleanup;
+
+fail:
+    av_log(avctx, AV_LOG_ERROR, "jxrlib JPEG XR decode failed (error=%d)\\n", (int)jerr);
+cleanup:
+    if (decoder)
+        decoder->Release(&decoder);
+    if (stream)
+        stream->Close(&stream);
+    if (codec_factory)
+        codec_factory->Release(&codec_factory);
+    if (factory)
+        factory->Release(&factory);
+    return ret;
+}
+
+const FFCodec ff_libjxr_decoder = {
+    .p.name = "libjxr",
+    CODEC_LONG_NAME("JPEG XR via jxrlib"),
+    .p.type = AVMEDIA_TYPE_VIDEO,
+    .p.id = AV_CODEC_ID_JPEGXR,
+    .p.capabilities = AV_CODEC_CAP_DR1,
+    FF_CODEC_DECODE_CB(libjxr_decode_frame),
+    .p.wrapper_name = "libjxr",
+};
+''')
+PYJXR
+}
+
+verify_jxr_binary() {
+  local exe="$1" test_dir="${2:-$BUILDROOT/jxr-validation}"
+  local encoders decoders
+  encoders="$("$exe" -hide_banner -encoders 2>/dev/null | tr -d '\r')"
+  decoders="$("$exe" -hide_banner -decoders 2>/dev/null | tr -d '\r')"
+  grep -q '[[:space:]]libjxr[[:space:]]' <<<"$encoders" || { echo "libjxr encoder missing" >&2; exit 1; }
+  grep -q '[[:space:]]libjxr[[:space:]]' <<<"$decoders" || { echo "libjxr decoder missing" >&2; exit 1; }
+  rm -rf "$test_dir"
+  mkdir -p "$test_dir"
+  python3 - "$test_dir/input.rgb" <<'PYRGB'
+from pathlib import Path
+import sys
+w = h = 16
+buf = bytearray()
+for y in range(h):
+    for x in range(w):
+        buf += bytes(((x * 17) & 255, (y * 17) & 255, ((x ^ y) * 17) & 255))
+Path(sys.argv[1]).write_bytes(buf)
+PYRGB
+  "$exe" -hide_banner -loglevel error \
+    -f rawvideo -pixel_format rgb24 -video_size 16x16 -i "$test_dir/input.rgb" \
+    -frames:v 1 -c:v libjxr "$test_dir/test.jxr"
+  "$exe" -hide_banner -loglevel error \
+    -i "$test_dir/test.jxr" -frames:v 1 -pix_fmt rgb24 -f rawvideo "$test_dir/output.rgb"
+  cmp -s "$test_dir/input.rgb" "$test_dir/output.rgb" || {
+    echo "JPEG XR lossless RGB24 round-trip mismatch" >&2
+    exit 1
+  }
+  echo "JPEG XR libjxr lossless RGB24 encode/decode: OK"
+}
+
 patch_ffmpeg_libplacebo_vulkan_import() {
   local ff_stage="$1" cfg="$PREFIX/include/libplacebo/config.h" api
   sed -i 's/-lstdc++/-lc++/g' "$ff_stage/configure"
@@ -581,6 +1065,268 @@ patch_ffmpeg_libplacebo_vulkan_import() {
   perl -0pi -e 's/#ifdef VK_KHR_internally_synchronized_queues\n([[:space:]]*\{ VK_KHR_INTERNALLY_SYNCHRONIZED_QUEUES_EXTENSION_NAME,[[:space:]]*FF_VK_EXT_INTERNAL_QUEUE_SYNC[[:space:]]*\},\n)#endif/#if 0 \&\& defined(VK_KHR_internally_synchronized_queues)\n$1#endif/g' \
     "$ff_stage/libavutil/hwcontext_vulkan.c" \
     "$ff_stage/libavutil/vulkan_loader.h"
+}
+
+patch_ffmpeg_nvenc_hdr_static() {
+  local ff_stage="$1"
+  local nvenc_c="$ff_stage/libavcodec/nvenc.c"
+
+  if grep -q 'nvenc_alloc_hdr_static_payload' "$nvenc_c"; then
+    echo "FFmpeg NVENC static HDR10 (MDCV/CLL) patch already applied"
+    return 0
+  fi
+
+  echo "== Patch FFmpeg NVENC static HDR10 (MDCV/CLL) =="
+  python3 - "$nvenc_c" <<'PYNVENCSTATIC'
+from pathlib import Path
+import sys
+p = Path(sys.argv[1])
+s = p.read_text()
+
+helper = r"""/* Static HDR10 metadata for AV1. NVENC's AV1 encoder ignores
+ * NV_ENC_CONFIG_AV1.outputMasteringDisplay / outputMaxCll - hevc_nvenc writes
+ * MDCV/CLL, av1_nvenc does not - so push them through the AV1 OBU payload
+ * array, which nvenc.c already feeds from ctx->sei_data. */
+static int nvenc_alloc_hdr_static_payload(const AVFrame *frame, int metadata_type,
+                                          uint8_t **data, size_t *size)
+{
+    const AVFrameSideData *sd_mdcv =
+        av_frame_get_side_data(frame, AV_FRAME_DATA_MASTERING_DISPLAY_METADATA);
+    const AVFrameSideData *sd_cll =
+        av_frame_get_side_data(frame, AV_FRAME_DATA_CONTENT_LIGHT_LEVEL);
+
+    *data = NULL;
+    *size = 0;
+
+    if (metadata_type == AV1_METADATA_TYPE_HDR_MDCV && sd_mdcv) {
+        const AVMasteringDisplayMetadata *mdm = (const AVMasteringDisplayMetadata *)sd_mdcv->data;
+        const int chroma_den = 1 << 16, max_luma_den = 1 << 8, min_luma_den = 1 << 14;
+        uint8_t *buf, *q;
+        int i;
+
+        if (!mdm->has_primaries || !mdm->has_luminance)
+            return 0;
+
+        buf = q = av_malloc(24);
+        if (!buf)
+            return AVERROR(ENOMEM);
+
+        for (i = 0; i < 3; i++) {
+            bytestream_put_be16(&q, av_rescale(mdm->display_primaries[i][0].num, chroma_den, mdm->display_primaries[i][0].den));
+            bytestream_put_be16(&q, av_rescale(mdm->display_primaries[i][1].num, chroma_den, mdm->display_primaries[i][1].den));
+        }
+        bytestream_put_be16(&q, av_rescale(mdm->white_point[0].num, chroma_den, mdm->white_point[0].den));
+        bytestream_put_be16(&q, av_rescale(mdm->white_point[1].num, chroma_den, mdm->white_point[1].den));
+        bytestream_put_be32(&q, av_rescale(mdm->max_luminance.num, max_luma_den, mdm->max_luminance.den));
+        bytestream_put_be32(&q, av_rescale(mdm->min_luminance.num, min_luma_den, mdm->min_luminance.den));
+
+        *data = buf;
+        *size = 24;
+        return 1;
+    }
+
+    if (metadata_type == AV1_METADATA_TYPE_HDR_CLL && sd_cll) {
+        const AVContentLightMetadata *cll = (const AVContentLightMetadata *)sd_cll->data;
+        uint8_t *buf, *q;
+
+        buf = q = av_malloc(4);
+        if (!buf)
+            return AVERROR(ENOMEM);
+
+        bytestream_put_be16(&q, cll->MaxCLL);
+        bytestream_put_be16(&q, cll->MaxFALL);
+
+        *data = buf;
+        *size = 4;
+        return 1;
+    }
+
+    return 0;
+}
+
+"""
+
+anchor = 'static int prepare_sei_data_array(AVCodecContext *avctx, const AVFrame *frame)'
+if s.count(anchor) != 1:
+    raise SystemExit(f"{p}: prepare_sei_data_array anchor not unique")
+s = s.replace(anchor, helper + anchor, 1)
+
+call_old = '    if (!ctx->udu_sei)\n        return sei_count;\n'
+call_new = r"""    if (avctx->codec->id == AV_CODEC_ID_AV1) {
+        static const int hdr_static_types[] = {
+            AV1_METADATA_TYPE_HDR_MDCV, AV1_METADATA_TYPE_HDR_CLL,
+        };
+        size_t t;
+
+        for (t = 0; t < FF_ARRAY_ELEMS(hdr_static_types); t++) {
+            uint8_t *payload_data = NULL;
+            size_t payload_size = 0;
+            void *tmp;
+
+            res = nvenc_alloc_hdr_static_payload(frame, hdr_static_types[t],
+                                                 &payload_data, &payload_size);
+            if (res < 0)
+                goto error;
+            if (res == 0)
+                continue;
+
+            tmp = av_fast_realloc(ctx->sei_data, &ctx->sei_data_size,
+                                  (sei_count + 1) * sizeof(*ctx->sei_data));
+            if (!tmp) {
+                av_free(payload_data);
+                res = AVERROR(ENOMEM);
+                goto error;
+            }
+
+            ctx->sei_data = tmp;
+            ctx->sei_data[sei_count].payloadSize = (uint32_t)payload_size;
+            ctx->sei_data[sei_count].payload = payload_data;
+            ctx->sei_data[sei_count].payloadType = hdr_static_types[t];
+            sei_count++;
+        }
+    }
+
+""" + call_old
+if s.count(call_old) != 1:
+    raise SystemExit(f"{p}: udu_sei anchor not unique")
+s = s.replace(call_old, call_new, 1)
+
+p.write_text(s)
+PYNVENCSTATIC
+}
+
+
+patch_ffmpeg_nvenc_hdr10plus() {
+  local ff_stage="$1"
+  local nvenc_c="$ff_stage/libavcodec/nvenc.c"
+
+  if grep -q 'nvenc_alloc_hdr10_plus_payload' "$nvenc_c"; then
+    echo "FFmpeg NVENC HDR10+ passthrough patch already applied"
+    return 0
+  fi
+  if grep -q 'AV_FRAME_DATA_DYNAMIC_HDR_PLUS' "$nvenc_c"; then
+    echo "FFmpeg NVENC already contains HDR10+ side-data handling; skip local patch"
+    return 0
+  fi
+
+  echo "== Patch FFmpeg NVENC HDR10+ passthrough =="
+  git -C "$ff_stage" apply --recount --whitespace=nowarn <<'PATCH_NVENC_HDR10PLUS'
+diff --git a/libavcodec/nvenc.c b/libavcodec/nvenc.c
+index 5ea094e095..0b138e1ccd 100644
+--- a/libavcodec/nvenc.c
++++ b/libavcodec/nvenc.c
+@@ -31,6 +31,7 @@
+ #include "libavutil/hwcontext_cuda.h"
+ #include "libavutil/hwcontext.h"
+ #include "libavutil/cuda_check.h"
++#include "libavutil/hdr_dynamic_metadata.h"
+ #include "libavutil/imgutils.h"
+ #include "libavutil/mem.h"
+ #include "libavutil/pixdesc.h"
+@@ -40,9 +41,11 @@
+ #include "libavutil/stereo3d.h"
+ #include "libavutil/tdrdi.h"
+ #include "atsc_a53.h"
++#include "bytestream.h"
+ #include "codec_desc.h"
+ #include "encode.h"
+ #include "internal.h"
++#include "itut35.h"
+ 
+ #define CHECK_CU(x) FF_CUDA_CHECK_DL(avctx, dl_fn->cuda_dl, x)
+ 
+@@ -2723,6 +2726,47 @@ static int output_ready(AVCodecContext *avctx, int flush)
+     return (nb_ready > 0) && (nb_ready + nb_pending >= ctx->async_depth);
+ }
+ 
++static int nvenc_alloc_hdr10_plus_payload(const AVFrame *frame, uint8_t **data, size_t *size)
++{
++    const AVFrameSideData *side_data =
++        av_frame_get_side_data(frame, AV_FRAME_DATA_DYNAMIC_HDR_PLUS);
++    const AVDynamicHDRPlus *hdr_plus;
++    uint8_t *payload;
++    size_t payload_size;
++    int ret;
++
++    if (!side_data) {
++        *data = NULL;
++        *size = 0;
++        return 0;
++    }
++
++    hdr_plus = (const AVDynamicHDRPlus *)side_data->data;
++    ret = av_dynamic_hdr_plus_to_t35(hdr_plus, NULL, &payload_size);
++    if (ret < 0)
++        return ret;
++
++    *size = payload_size + 6;
++    *data = av_malloc(*size);
++    if (!*data)
++        return AVERROR(ENOMEM);
++
++    payload = *data;
++    bytestream_put_byte(&payload, ITU_T_T35_COUNTRY_CODE_US);
++    bytestream_put_be16(&payload, ITU_T_T35_PROVIDER_CODE_SAMSUNG);
++    bytestream_put_be16(&payload, 0x0001);
++    bytestream_put_byte(&payload, 0x04);
++
++    ret = av_dynamic_hdr_plus_to_t35(hdr_plus, &payload, &payload_size);
++    if (ret < 0) {
++        av_freep(data);
++        *size = 0;
++        return ret;
++    }
++
++    return 1;
++}
++
+ static int prepare_sei_data_array(AVCodecContext *avctx, const AVFrame *frame)
+ {
+     NvencContext *ctx = avctx->priv_data;
+@@ -2797,6 +2841,43 @@ static int prepare_sei_data_array(AVCodecContext *avctx, const AVFrame *frame)
+         }
+     }
+ 
++    if (avctx->codec->id == AV_CODEC_ID_HEVC
++#if CONFIG_AV1_NVENC_ENCODER
++        || avctx->codec->id == AV_CODEC_ID_AV1
++#endif
++    ) {
++        uint8_t *hdr_plus_data = NULL;
++        size_t hdr_plus_size = 0;
++
++        res = nvenc_alloc_hdr10_plus_payload(frame, &hdr_plus_data, &hdr_plus_size);
++        if (res < 0) {
++            av_log(ctx, AV_LOG_ERROR, "Error serializing HDR10+ metadata\n");
++            goto error;
++        }
++
++        if (res > 0) {
++            void *tmp = av_fast_realloc(ctx->sei_data,
++                                        &ctx->sei_data_size,
++                                        (sei_count + 1) * sizeof(*ctx->sei_data));
++            if (!tmp) {
++                av_free(hdr_plus_data);
++                res = AVERROR(ENOMEM);
++                goto error;
++            }
++
++            ctx->sei_data = tmp;
++            ctx->sei_data[sei_count].payloadSize = (uint32_t)hdr_plus_size;
++            ctx->sei_data[sei_count].payload = hdr_plus_data;
++#if CONFIG_AV1_NVENC_ENCODER
++            if (avctx->codec->id == AV_CODEC_ID_AV1)
++                ctx->sei_data[sei_count].payloadType = AV1_METADATA_TYPE_ITUT_T35;
++            else
++#endif
++                ctx->sei_data[sei_count].payloadType = SEI_TYPE_USER_DATA_REGISTERED_ITU_T_T35;
++            sei_count++;
++        }
++    }
++
+     if (!ctx->udu_sei)
+         return sei_count;
+PATCH_NVENC_HDR10PLUS
 }
 
 validate_config() {
@@ -597,6 +1343,9 @@ validate_config() {
   grep -q '^CONFIG_LIBOPUS_ENCODER=yes$' "$config_mak" || { echo "libopus encoder disabled"; exit 1; }
   grep -q '^CONFIG_OPUS_DECODER=yes$' "$config_mak" || { echo "native Opus decoder disabled"; exit 1; }
   grep -q '^CONFIG_LIBSOXR=yes$' "$config_mak" || { echo "libsoxr disabled"; exit 1; }
+  grep -q '^CONFIG_LIBJXR=yes$' "$config_mak" || { echo "libjxr disabled"; exit 1; }
+  grep -q '^CONFIG_LIBJXR_ENCODER=yes$' "$config_mak" || { echo "libjxr encoder disabled"; exit 1; }
+  grep -q '^CONFIG_LIBJXR_DECODER=yes$' "$config_mak" || { echo "libjxr decoder disabled"; exit 1; }
   grep -q '^CONFIG_ARESAMPLE_FILTER=yes$' "$config_mak" || { echo "aresample filter disabled"; exit 1; }
   grep -q '^CONFIG_LIBPLACEBO_FILTER=yes$' "$config_mak" || { echo "libplacebo filter disabled"; exit 1; }
   grep -q '^CONFIG_VULKAN=yes$' "$config_mak" || { echo "Vulkan disabled"; exit 1; }
@@ -607,13 +1356,13 @@ validate_config() {
     grep -q '^CONFIG_AV1_NVENC_ENCODER=yes$' "$config_mak" || { echo "av1_nvenc disabled"; exit 1; }
     grep -q '^CONFIG_HEVC_NVENC_ENCODER=yes$' "$config_mak" || { echo "hevc_nvenc disabled"; exit 1; }
     grep -q '^CONFIG_CUDA_NVCC=yes$' "$config_mak" || { echo "cuda-nvcc disabled"; exit 1; }
-    allowed='CONFIG_(HEVC_NVENC|AV1_NVENC|AAC|LIBOPUS)_ENCODER=yes|CONFIG_FRAME_THREAD_ENCODER=yes'
+    allowed='CONFIG_(HEVC_NVENC|AV1_NVENC|AAC|LIBOPUS|LIBJXR|RAWVIDEO)_ENCODER=yes|CONFIG_FRAME_THREAD_ENCODER=yes'
     grep -q 'nonfree' "$config_h" || { echo "NVENC build is expected to be nonfree"; exit 1; }
   else
     grep -q '^CONFIG_AV1_QSV_ENCODER=yes$' "$config_mak" || { echo "av1_qsv disabled"; exit 1; }
     grep -q '^CONFIG_HEVC_QSV_ENCODER=yes$' "$config_mak" || { echo "hevc_qsv disabled"; exit 1; }
     grep -q '^CONFIG_LIBVPL=yes$' "$config_mak" || { echo "libvpl disabled"; exit 1; }
-    allowed='CONFIG_(HEVC_QSV|AV1_QSV|AAC|LIBOPUS)_ENCODER=yes|CONFIG_FRAME_THREAD_ENCODER=yes'
+    allowed='CONFIG_(HEVC_QSV|AV1_QSV|AAC|LIBOPUS|LIBJXR|RAWVIDEO)_ENCODER=yes|CONFIG_FRAME_THREAD_ENCODER=yes'
   fi
   unexpected="$(grep -E '^CONFIG_.*_ENCODER=yes$' "$config_mak" | grep -Ev "$allowed" || true)"
   [[ -z "$unexpected" ]] || { echo "unexpected encoders:"; printf '%s\n' "$unexpected"; exit 1; }
@@ -670,12 +1419,14 @@ verify_lite_binary() {
   mapfile -t names < <(awk '$1 ~ /^[VAS][A-Z.]{5}$/ && $2 != "=" { print $2 }' <<< "$output")
   for name in "${names[@]}"; do
     case "$BACKEND:$name" in
-      nvenc:aac|nvenc:hevc_nvenc|nvenc:av1_nvenc|nvenc:libopus|qsv:aac|qsv:hevc_qsv|qsv:av1_qsv|qsv:libopus) ;;
+      nvenc:aac|nvenc:hevc_nvenc|nvenc:av1_nvenc|nvenc:libopus|nvenc:libjxr|nvenc:rawvideo|qsv:aac|qsv:hevc_qsv|qsv:av1_qsv|qsv:libopus|qsv:libjxr|qsv:rawvideo) ;;
       *) echo "unexpected runtime encoder: $name"; exit 1 ;;
     esac
   done
   grep -q '[[:space:]]libopus[[:space:]]' <<< "$output" || { echo "libopus missing"; exit 1; }
   grep -q '[[:space:]]opus[[:space:]]' <<< "$("$exe" -hide_banner -decoders 2>/dev/null)" || { echo "native opus decoder missing"; exit 1; }
+  grep -q '[[:space:]]libjxr[[:space:]]' <<< "$output" || { echo "libjxr encoder missing"; exit 1; }
+  grep -q '[[:space:]]libjxr[[:space:]]' <<< "$("$exe" -hide_banner -decoders 2>/dev/null)" || { echo "libjxr decoder missing"; exit 1; }
   grep -q 'nmr' <<< "$("$exe" -hide_banner -h encoder=aac 2>&1)" || { echo "NMR AAC coder missing"; exit 1; }
   grep -q 'libplacebo' <<< "$("$exe" -hide_banner -h filter=libplacebo 2>&1)" || { echo "libplacebo filter help failed"; exit 1; }
   filters="$("$exe" -hide_banner -filters 2>/dev/null | tr -d '\r')"
@@ -756,6 +1507,8 @@ write_build_manifest() {
     --validate "final encoder whitelist contains AAC, libopus, and only expected video encoders"
     --validate "48 kHz stereo Ogg Opus encode and final-ffmpeg decode/re-encode roundtrip succeeded"
     --validate "native NMR AAC option remains present"
+    --validate "NVENC HDR10+ dynamic metadata passthrough source path compiled"
+    --validate "JPEG XR jxrlib encoder/decoder configured and lossless RGB24 round-trip passed"
   )
   if [[ "$HARDWARE_STATUS" == "passed" ]]; then
     args+=(--validate "AV1 NVENC hierarchical B-reference option present and runtime invocation succeeded; bitstream B-frame production not independently confirmed")
@@ -820,6 +1573,10 @@ EOF
       write_soxr_pc
       ;;
 
+    jxrlib)
+      build_jxrlib
+      ;;
+
     libshaderc)
       build_shaderc_from_source
       ;;
@@ -881,13 +1638,20 @@ EOF
 
     ffmpeg)
       [[ "$BACKEND" == "nvenc" ]] && setup_cuda
-      PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig" "$PKG_CONFIG" --exists soxr libplacebo shaderc vulkan || { echo "required pkg-config files missing"; exit 1; }
+      PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig" "$PKG_CONFIG" --exists soxr libjxr libplacebo shaderc vulkan || { echo "required pkg-config files missing"; exit 1; }
       [[ "$BACKEND" == "qsv" ]] && PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig" "$PKG_CONFIG" --exists vpl || { [[ "$BACKEND" == "nvenc" ]] || exit 1; }
       [[ "$BACKEND" == "nvenc" ]] && PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig" "$PKG_CONFIG" --exists ffnvcodec || { [[ "$BACKEND" == "qsv" ]] || exit 1; }
 
       local ff_stage ff_bld extra_cflags extra_ldflags extra_libs ffmpeg_nvccflags
       ff_stage="$(stage_src ffmpeg-source)"
+      patch_ffmpeg_jxr "$ff_stage"
       patch_ffmpeg_libplacebo_vulkan_import "$ff_stage"
+      patch_ffmpeg_nvenc_hdr10plus "$ff_stage"
+      patch_ffmpeg_nvenc_hdr_static "$ff_stage"
+      grep -q 'AV_FRAME_DATA_DYNAMIC_HDR_PLUS' "$ff_stage/libavcodec/nvenc.c" || {
+        echo "FFmpeg NVENC HDR10+ passthrough is missing"
+        exit 1
+      }
       ff_bld="$BUILDROOT/ffmpeg"
       rm -rf "$ff_bld"
       mkdir -p "$ff_bld"
@@ -931,6 +1695,7 @@ EOF
         --disable-pthreads
         --enable-libopus
         --enable-libsoxr
+        --enable-libjxr
         --enable-vulkan
         --enable-vulkan-static
         --enable-libplacebo
@@ -961,13 +1726,13 @@ EOF
 
       configure_cmd+=(--disable-encoders)
       if [[ "$BACKEND" == "nvenc" ]]; then
-        for e in hevc_nvenc av1_nvenc aac libopus; do add_if_exists "$ff_stage" --list-encoders "$e" --enable-encoder; done
+        for e in hevc_nvenc av1_nvenc aac libopus libjxr rawvideo; do add_if_exists "$ff_stage" --list-encoders "$e" --enable-encoder; done
       else
-        for e in hevc_qsv av1_qsv aac libopus; do add_if_exists "$ff_stage" --list-encoders "$e" --enable-encoder; done
+        for e in hevc_qsv av1_qsv aac libopus libjxr rawvideo; do add_if_exists "$ff_stage" --list-encoders "$e" --enable-encoder; done
       fi
 
       configure_cmd+=(--disable-decoders)
-      for d in h264 hevc av1 vp9 vp8 mpeg2video mpeg4 msmpeg4v3 vc1 wmv3 mjpeg prores rawvideo aac aac_latm mp3 ac3 eac3 truehd dca flac opus vorbis wavpack alac pcm_s16le pcm_s24le pcm_s32le pcm_f32le pcm_f64le; do
+      for d in h264 hevc av1 vp9 vp8 mpeg2video mpeg4 msmpeg4v3 vc1 wmv3 mjpeg prores rawvideo libjxr aac aac_latm mp3 ac3 eac3 truehd dca flac opus vorbis wavpack alac pcm_s16le pcm_s24le pcm_s32le pcm_f32le pcm_f64le; do
         add_if_exists "$ff_stage" --list-decoders "$d" --enable-decoder
       done
 
@@ -981,7 +1746,7 @@ EOF
       configure_cmd+=(--disable-demuxers)
       for d in matroska mov mpegts h264 hevc av1 rawvideo pcm_s16le image2 concat aac mp3 flac ogg wav vapoursynth; do add_if_exists "$ff_stage" --list-demuxers "$d" --enable-demuxer; done
       configure_cmd+=(--disable-muxers)
-      for m in matroska mp4 mov ipod mpegts null rawvideo adts wav flac ogg; do add_if_exists "$ff_stage" --list-muxers "$m" --enable-muxer; done
+      for m in matroska mp4 mov ipod mpegts null rawvideo image2 adts wav flac ogg; do add_if_exists "$ff_stage" --list-muxers "$m" --enable-muxer; done
       configure_cmd+=(--disable-parsers)
       for p in h264 hevc av1 aac ac3 dca mlp opus vorbis mjpeg vp9 vp8 mpeg4video vc1; do add_if_exists "$ff_stage" --list-parsers "$p" --enable-parser; done
       configure_cmd+=(--disable-bsfs)
@@ -1011,6 +1776,7 @@ EOF
       check_single_file_imports "$SCRIPT_DIR/ffmpeg.exe"
       verify_lite_binary "$SCRIPT_DIR/ffmpeg.exe"
       verify_opus_roundtrip "$SCRIPT_DIR/ffmpeg.exe"
+      verify_jxr_binary "$SCRIPT_DIR/ffmpeg.exe" "$BUILDROOT/jxr-validation"
       verify_nvenc_hierarchical "$SCRIPT_DIR/ffmpeg.exe"
       ;;
 
