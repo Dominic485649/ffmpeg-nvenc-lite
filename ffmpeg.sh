@@ -1196,6 +1196,163 @@ PYNVENCSTATIC
 }
 
 
+patch_ffmpeg_nvenc_dovi_p8_p10() {
+  local ff_stage="$1"
+  local nvenc_c="$ff_stage/libavcodec/nvenc.c"
+  local nvenc_h="$ff_stage/libavcodec/nvenc.h"
+
+  if grep -q 'nvenc_alloc_dovi_payload' "$nvenc_c"; then
+    echo "FFmpeg NVENC AV1 Dolby Vision HEVC P8 / AV1 P10 passthrough patch already applied"
+    return 0
+  fi
+
+  echo "== Patch FFmpeg NVENC HEVC P8 / AV1 P10 Dolby Vision RPU injection =="
+  python3 - "$nvenc_h" "$nvenc_c" <<'PYDOVINVENC'
+from pathlib import Path
+import sys
+
+header, source = map(Path, sys.argv[1:])
+
+def replace_once(path, old, new):
+    text = path.read_text()
+    if text.count(old) != 1:
+        raise SystemExit(f"{path}: expected one patch anchor, found {text.count(old)}: {old[:72]!r}")
+    path.write_text(text.replace(old, new, 1))
+
+replace_once(
+    header,
+    '#include "avcodec.h"\n',
+    '#include "avcodec.h"\n#include "dovi_rpu.h"\n',
+)
+replace_once(
+    header,
+    '    NV_ENC_SEI_PAYLOAD *sei_data;\n    int sei_data_size;\n',
+    '    NV_ENC_SEI_PAYLOAD *sei_data;\n    int sei_data_size;\n    DOVIContext dovi;\n',
+)
+replace_once(
+    source,
+    '    int i, res;\n\n    if (ctx->a53_cc && av_frame_get_side_data(frame, AV_FRAME_DATA_A53_CC)) {\n',
+    r'''    int i, res;
+
+#if CONFIG_AV1_NVENC_ENCODER || CONFIG_HEVC_NVENC_ENCODER
+    if (avctx->codec->id == AV_CODEC_ID_AV1 ||
+        avctx->codec->id == AV_CODEC_ID_HEVC) {
+        uint8_t *dovi_data = NULL;
+        int dovi_size = 0;
+
+        res = nvenc_alloc_dovi_payload(avctx, ctx, frame, &dovi_data, &dovi_size);
+        if (res < 0)
+            goto error;
+        if (dovi_data) {
+            void *tmp;
+            if (dovi_size <= 0) {
+                av_free(dovi_data);
+                res = AVERROR_INVALIDDATA;
+                goto error;
+            }
+            tmp = av_fast_realloc(ctx->sei_data, &ctx->sei_data_size,
+                                  (sei_count + 1) * sizeof(*ctx->sei_data));
+            if (!tmp) {
+                av_free(dovi_data);
+                res = AVERROR(ENOMEM);
+                goto error;
+            }
+            ctx->sei_data = tmp;
+            ctx->sei_data[sei_count].payloadSize = (uint32_t)dovi_size;
+            if (avctx->codec->id == AV_CODEC_ID_AV1)
+                ctx->sei_data[sei_count].payloadType = AV1_METADATA_TYPE_ITUT_T35;
+            else
+                ctx->sei_data[sei_count].payloadType = SEI_TYPE_USER_DATA_REGISTERED_ITU_T_T35;
+            ctx->sei_data[sei_count].payload = dovi_data;
+            sei_count++;
+        }
+    }
+#endif
+
+    if (!ctx->extra_sei)
+        return sei_count;
+
+    if (ctx->a53_cc && av_frame_get_side_data(frame, AV_FRAME_DATA_A53_CC)) {
+''',
+)
+replace_once(
+    source,
+    'static int prepare_sei_data_array(AVCodecContext *avctx, const AVFrame *frame)\n',
+    r'''#if CONFIG_AV1_NVENC_ENCODER || CONFIG_HEVC_NVENC_ENCODER
+static int nvenc_alloc_dovi_payload(AVCodecContext *avctx, NvencContext *ctx,
+                                        const AVFrame *frame, uint8_t **data,
+                                        int *size)
+{
+    const AVFrameSideData *sd =
+        av_frame_get_side_data(frame, AV_FRAME_DATA_DOVI_METADATA);
+
+    *data = NULL;
+    *size = 0;
+    if (!sd)
+        return 0;
+    if (!ctx->dovi.cfg.dv_profile) {
+        av_log(avctx, AV_LOG_ERROR,
+               "Dolby Vision metadata is present, but a valid Dolby Vision codec configuration "
+               "could not be derived. Preserve 10-bit 4:2:0 and the source color tags.\n");
+        return AVERROR_INVALIDDATA;
+    }
+
+    return ff_dovi_rpu_generate(&ctx->dovi,
+                                (const AVDOVIMetadata *)sd->data,
+                                FF_DOVI_WRAP_T35, data, size);
+}
+#endif
+
+static int prepare_sei_data_array(AVCodecContext *avctx, const AVFrame *frame)
+''',
+)
+replace_once(
+    source,
+    '        if (ctx->extra_sei) {\n            res = prepare_sei_data_array(avctx, frame);\n',
+    r'''        if (ctx->extra_sei
+#if CONFIG_AV1_NVENC_ENCODER || CONFIG_HEVC_NVENC_ENCODER
+            || ((avctx->codec->id == AV_CODEC_ID_AV1 ||
+                 avctx->codec->id == AV_CODEC_ID_HEVC) &&
+                av_frame_get_side_data(frame, AV_FRAME_DATA_DOVI_METADATA))
+#endif
+        ) {
+            res = prepare_sei_data_array(avctx, frame);
+''',
+)
+replace_once(
+    source,
+    '    NvencContext *ctx = avctx->priv_data;\n    int ret;\n\n    if (IS_HWACCEL(avctx->pix_fmt)) {\n',
+    r'''    NvencContext *ctx = avctx->priv_data;
+    int ret;
+
+#if CONFIG_AV1_NVENC_ENCODER || CONFIG_HEVC_NVENC_ENCODER
+    if (avctx->codec->id == AV_CODEC_ID_AV1 ||
+        avctx->codec->id == AV_CODEC_ID_HEVC) {
+        const enum AVPixelFormat pix_fmt = avctx->pix_fmt;
+
+        ctx->dovi.logctx = avctx;
+        ctx->dovi.enable = FF_DOVI_AUTOMATIC;
+        if (ctx->data_pix_fmt == AV_PIX_FMT_P010)
+            avctx->pix_fmt = AV_PIX_FMT_YUV420P10;
+        ret = ff_dovi_configure(&ctx->dovi, avctx);
+        avctx->pix_fmt = pix_fmt;
+        if (ret < 0)
+            return ret;
+    }
+#endif
+
+    if (IS_HWACCEL(avctx->pix_fmt)) {
+''',
+)
+replace_once(
+    source,
+    '    int i, res;\n\n    /* the encoder has to be flushed before it can be closed */\n',
+    '    int i, res;\n\n#if CONFIG_AV1_NVENC_ENCODER || CONFIG_HEVC_NVENC_ENCODER\n    ff_dovi_ctx_unref(&ctx->dovi);\n#endif\n\n    /* the encoder has to be flushed before it can be closed */\n',
+)
+PYDOVINVENC
+}
+
+
 patch_ffmpeg_nvenc_hdr10plus() {
   local ff_stage="$1"
   local nvenc_c="$ff_stage/libavcodec/nvenc.c"
@@ -1330,7 +1487,7 @@ PATCH_NVENC_HDR10PLUS
 }
 
 validate_config() {
-  local config_mak="$1" config_h="$2" unexpected allowed filter_line filter_name filter_lower f found
+  local config_mak="$1" config_h="$2" unexpected allowed filter_line filter_name filter_lower f found feature
   local allowed_filters=("${COMMON_FILTERS[@]}")
   if [[ "$BACKEND" == "nvenc" ]]; then
     allowed_filters+=("${NVENC_FILTERS[@]}")
@@ -1349,6 +1506,9 @@ validate_config() {
   grep -q '^CONFIG_ARESAMPLE_FILTER=yes$' "$config_mak" || { echo "aresample filter disabled"; exit 1; }
   grep -q '^CONFIG_LIBPLACEBO_FILTER=yes$' "$config_mak" || { echo "libplacebo filter disabled"; exit 1; }
   grep -q '^CONFIG_VULKAN=yes$' "$config_mak" || { echo "Vulkan disabled"; exit 1; }
+  for feature in CONFIG_HEVC_DECODER CONFIG_AV1_DECODER CONFIG_DOVI_RPUDEC CONFIG_DOVI_RPUENC CONFIG_DOVI_RPU_BSF CONFIG_DOVI_SPLIT_BSF CONFIG_MOV_DEMUXER CONFIG_MOV_MUXER CONFIG_MATROSKA_DEMUXER CONFIG_MATROSKA_MUXER CONFIG_MPEGTS_DEMUXER CONFIG_MPEGTS_MUXER; do
+    grep -q "^$feature=yes$" "$config_mak" || { echo "Dolby Vision feature disabled: $feature"; exit 1; }
+  done
   [[ -s "$PREFIX/lib/libshaderc_combined.a" && -d "$PREFIX/include/shaderc" ]] || { echo "libshaderc static library or headers missing"; exit 1; }
   PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig" "$PKG_CONFIG" --exists shaderc || { echo "shaderc.pc is not usable"; exit 1; }
 
@@ -1413,7 +1573,7 @@ check_single_file_imports() {
 }
 
 verify_lite_binary() {
-  local exe="$1" output filters hwaccels name
+  local exe="$1" output filters hwaccels decoders bsfs muxers placebo_help name
   local names=()
   output="$("$exe" -hide_banner -encoders 2>/dev/null | tr -d '\r')"
   mapfile -t names < <(awk '$1 ~ /^[VAS][A-Z.]{5}$/ && $2 != "=" { print $2 }' <<< "$output")
@@ -1428,7 +1588,21 @@ verify_lite_binary() {
   grep -q '[[:space:]]libjxr[[:space:]]' <<< "$output" || { echo "libjxr encoder missing"; exit 1; }
   grep -q '[[:space:]]libjxr[[:space:]]' <<< "$("$exe" -hide_banner -decoders 2>/dev/null)" || { echo "libjxr decoder missing"; exit 1; }
   grep -q 'nmr' <<< "$("$exe" -hide_banner -h encoder=aac 2>&1)" || { echo "NMR AAC coder missing"; exit 1; }
-  grep -q 'libplacebo' <<< "$("$exe" -hide_banner -h filter=libplacebo 2>&1)" || { echo "libplacebo filter help failed"; exit 1; }
+  placebo_help="$("$exe" -hide_banner -h filter=libplacebo 2>&1)"
+  grep -q 'libplacebo' <<< "$placebo_help" || { echo "libplacebo filter help failed"; exit 1; }
+  grep -q 'apply_dolbyvision' <<< "$placebo_help" || { echo "libplacebo Dolby Vision metadata application missing"; exit 1; }
+  decoders="$("$exe" -hide_banner -decoders 2>/dev/null | tr -d '\r')"
+  for name in hevc av1; do
+    grep -Eq "[[:space:]]$name([[:space:]]|$)" <<< "$decoders" || { echo "Dolby Vision base codec decoder missing: $name"; exit 1; }
+  done
+  bsfs="$("$exe" -hide_banner -bsfs 2>/dev/null | tr -d '\r')"
+  for name in dovi_rpu dovi_split; do
+    grep -Eq "(^|[[:space:]])$name([[:space:]]|$)" <<< "$bsfs" || { echo "Dolby Vision bitstream filter missing: $name"; exit 1; }
+  done
+  muxers="$("$exe" -hide_banner -muxers 2>/dev/null | tr -d '\r')"
+  for name in mov matroska; do
+    grep -Eq "[[:space:]]$name([[:space:]]|$)" <<< "$muxers" || { echo "Dolby Vision container muxer missing: $name"; exit 1; }
+  done
   filters="$("$exe" -hide_banner -filters 2>/dev/null | tr -d '\r')"
   hwaccels="$("$exe" -hide_banner -hwaccels 2>/dev/null | tr -d '\r')"
   if [[ "$BACKEND" == "nvenc" ]]; then
@@ -1508,6 +1682,8 @@ write_build_manifest() {
     --validate "48 kHz stereo Ogg Opus encode and final-ffmpeg decode/re-encode roundtrip succeeded"
     --validate "native NMR AAC option remains present"
     --validate "NVENC HDR10+ dynamic metadata passthrough source path compiled"
+    --validate "Dolby Vision HEVC Profile 8 and AV1 Profile 10 per-frame RPU injection paths compiled"
+    --skip "NVENC Dolby Vision P8/P10 injection was not round-trip tested on compatible hardware with Dolby Vision samples"
     --validate "JPEG XR jxrlib encoder/decoder configured and lossless RGB24 round-trip passed"
   )
   if [[ "$HARDWARE_STATUS" == "passed" ]]; then
@@ -1628,11 +1804,15 @@ EOF
         -Dshaderc=enabled \
         -Dopengl=disabled \
         -Dlcms=disabled \
-        -Ddovi=disabled \
+        -Ddovi=enabled \
         -Dlibdovi=disabled \
         -Dxxhash=disabled
       meson compile -C "$b" -j "$JOBS"
       meson install -C "$b"
+      grep -q '^#define PL_HAVE_DOVI 1$' "$PREFIX/include/libplacebo/config.h" || {
+        echo "libplacebo Dolby Vision support is disabled"
+        exit 1
+      }
       grep -q '^pl_has_vk_proc_addr=1' "$PREFIX/lib/pkgconfig/libplacebo.pc" || { echo "libplacebo did not link Vulkan proc addr"; exit 1; }
       ;;
 
@@ -1647,6 +1827,11 @@ EOF
       patch_ffmpeg_jxr "$ff_stage"
       patch_ffmpeg_libplacebo_vulkan_import "$ff_stage"
       patch_ffmpeg_nvenc_hdr10plus "$ff_stage"
+      patch_ffmpeg_nvenc_dovi_p8_p10 "$ff_stage"
+      grep -q 'nvenc_alloc_dovi_payload' "$ff_stage/libavcodec/nvenc.c" || {
+        echo "FFmpeg NVENC Dolby Vision HEVC P8 / AV1 P10 source patch is missing"
+        exit 1
+      }
       patch_ffmpeg_nvenc_hdr_static "$ff_stage"
       grep -q 'AV_FRAME_DATA_DYNAMIC_HDR_PLUS' "$ff_stage/libavcodec/nvenc.c" || {
         echo "FFmpeg NVENC HDR10+ passthrough is missing"
@@ -1750,7 +1935,7 @@ EOF
       configure_cmd+=(--disable-parsers)
       for p in h264 hevc av1 aac ac3 dca mlp opus vorbis mjpeg vp9 vp8 mpeg4video vc1; do add_if_exists "$ff_stage" --list-parsers "$p" --enable-parser; done
       configure_cmd+=(--disable-bsfs)
-      for b in h264_mp4toannexb hevc_mp4toannexb av1_metadata h264_metadata hevc_metadata aac_adtstoasc extract_extradata; do add_if_exists "$ff_stage" --list-bsfs "$b" --enable-bsf; done
+      for b in h264_mp4toannexb hevc_mp4toannexb av1_metadata h264_metadata hevc_metadata aac_adtstoasc extract_extradata dovi_rpu dovi_split; do add_if_exists "$ff_stage" --list-bsfs "$b" --enable-bsf; done
       configure_cmd+=(--disable-protocols)
       for p in file pipe; do add_if_exists "$ff_stage" --list-protocols "$p" --enable-protocol; done
       configure_cmd+=(--disable-devices)
