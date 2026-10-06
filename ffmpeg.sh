@@ -70,6 +70,7 @@ else
 fi
 
 COMMON_FILTERS=(
+  dovi_apply dovi_compose hlg2pq hdr10plus
   buffer buffersink abuffer abuffersink format aformat null anull
   fps trim atrim setpts asetpts settb asettb setparams setsar
   crop hflip vflip transpose rotate scale aresample
@@ -206,10 +207,10 @@ normalize_version() {
 }
 
 latest_stable_tag() {
-  local name="$1" repo_dir regex
+  local name="$1" repo_dir regex tag branch
   repo_dir="$(source_dir "$name")"
   regex="${TAG_REGEX[$name]}"
-  git -C "$repo_dir" for-each-ref --format='%(refname:short)' refs/tags \
+  tag="$(git -C "$repo_dir" for-each-ref --format='%(refname:short)' refs/tags \
     | sed 's/\^{}$//' \
     | sort -u \
     | { grep -E "$regex" || true; } \
@@ -217,7 +218,20 @@ latest_stable_tag() {
 " "$(normalize_version "$name" "$tag")" "$tag"; done \
     | sort -V \
     | tail -n 1 \
-    | cut -f2
+    | cut -f2)"
+  if [[ -n "$tag" ]]; then
+    printf '%s
+' "$tag"
+    return 0
+  fi
+  for branch in stable master main; do
+    if [[ "$regex" == *"$branch"* ]] \
+      && git -C "$repo_dir" show-ref --verify --quiet "refs/remotes/origin/$branch"; then
+      printf '%s
+' "$branch"
+      return 0
+    fi
+  done
 }
 
 clone_if_missing() {
@@ -1824,6 +1838,7 @@ EOF
 
       local ff_stage ff_bld extra_cflags extra_ldflags extra_libs ffmpeg_nvccflags
       ff_stage="$(stage_src ffmpeg-source)"
+      "$ROOT/shared-patches/apply-ffmpeg-patches.sh" "$ff_stage" lite
       patch_ffmpeg_jxr "$ff_stage"
       patch_ffmpeg_libplacebo_vulkan_import "$ff_stage"
       patch_ffmpeg_nvenc_hdr10plus "$ff_stage"
