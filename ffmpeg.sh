@@ -1375,10 +1375,6 @@ patch_ffmpeg_nvenc_hdr10plus() {
     echo "FFmpeg NVENC HDR10+ passthrough patch already applied"
     return 0
   fi
-  if grep -q 'AV_FRAME_DATA_DYNAMIC_HDR_PLUS' "$nvenc_c"; then
-    echo "FFmpeg NVENC already contains HDR10+ side-data handling; skip local patch"
-    return 0
-  fi
 
   echo "== Patch FFmpeg NVENC HDR10+ passthrough =="
   git -C "$ff_stage" apply --recount --whitespace=nowarn <<'PATCH_NVENC_HDR10PLUS'
@@ -1458,11 +1454,7 @@ index 5ea094e095..0b138e1ccd 100644
          }
      }
  
-+    if (avctx->codec->id == AV_CODEC_ID_HEVC
-+#if CONFIG_AV1_NVENC_ENCODER
-+        || avctx->codec->id == AV_CODEC_ID_AV1
-+#endif
-+    ) {
++    if (avctx->codec->id == AV_CODEC_ID_HEVC) {
 +        uint8_t *hdr_plus_data = NULL;
 +        size_t hdr_plus_size = 0;
 +
@@ -1485,12 +1477,7 @@ index 5ea094e095..0b138e1ccd 100644
 +            ctx->sei_data = tmp;
 +            ctx->sei_data[sei_count].payloadSize = (uint32_t)hdr_plus_size;
 +            ctx->sei_data[sei_count].payload = hdr_plus_data;
-+#if CONFIG_AV1_NVENC_ENCODER
-+            if (avctx->codec->id == AV_CODEC_ID_AV1)
-+                ctx->sei_data[sei_count].payloadType = AV1_METADATA_TYPE_ITUT_T35;
-+            else
-+#endif
-+                ctx->sei_data[sei_count].payloadType = SEI_TYPE_USER_DATA_REGISTERED_ITU_T_T35;
++            ctx->sei_data[sei_count].payloadType = SEI_TYPE_USER_DATA_REGISTERED_ITU_T_T35;
 +            sei_count++;
 +        }
 +    }
@@ -1501,7 +1488,7 @@ PATCH_NVENC_HDR10PLUS
 }
 
 validate_config() {
-  local config_mak="$1" config_h="$2" unexpected allowed filter_line filter_name filter_lower f found feature
+  local config_mak="$1" config_h="$2" ff_stage="${3:-.}" unexpected allowed filter_line filter_name filter_lower f found feature
   local allowed_filters=("${COMMON_FILTERS[@]}")
   if [[ "$BACKEND" == "nvenc" ]]; then
     allowed_filters+=("${NVENC_FILTERS[@]}")
@@ -1519,10 +1506,19 @@ validate_config() {
   grep -q '^CONFIG_LIBJXR_DECODER=yes$' "$config_mak" || { echo "libjxr decoder disabled"; exit 1; }
   grep -q '^CONFIG_ARESAMPLE_FILTER=yes$' "$config_mak" || { echo "aresample filter disabled"; exit 1; }
   grep -q '^CONFIG_LIBPLACEBO_FILTER=yes$' "$config_mak" || { echo "libplacebo filter disabled"; exit 1; }
+  grep -q '^CONFIG_HDR10PLUS_FILTER=yes$' "$config_mak" || { echo "HDR10+ producer filter disabled"; exit 1; }
+  grep -q "^CONFIG_AVS_DECODER=yes$" "$config_mak" || { echo "native AVS decoder disabled"; exit 1; }
+  grep -q "^CONFIG_CAVS_DECODER=yes$" "$config_mak" || { echo "native CAVS decoder disabled"; exit 1; }
+  grep -q "^CONFIG_CAVSVIDEO_PARSER=yes$" "$config_mak" || { echo "native CAVS parser disabled"; exit 1; }
+  for feature in CONFIG_LIBDAVS2_DECODER CONFIG_LIBUAVS3D_DECODER CONFIG_LIBXAVS_ENCODER CONFIG_LIBXAVS2_ENCODER; do
+    if grep -q "^$feature=yes$" "$config_mak"; then echo "External AVS2/3 decoder or AVS encoder unexpectedly enabled: $feature"; exit 1; fi
+  done
   grep -q '^CONFIG_VULKAN=yes$' "$config_mak" || { echo "Vulkan disabled"; exit 1; }
   for feature in CONFIG_HEVC_DECODER CONFIG_AV1_DECODER CONFIG_DOVI_RPUDEC CONFIG_DOVI_RPUENC CONFIG_DOVI_RPU_BSF CONFIG_DOVI_SPLIT_BSF CONFIG_MOV_DEMUXER CONFIG_MOV_MUXER CONFIG_MATROSKA_DEMUXER CONFIG_MATROSKA_MUXER CONFIG_MPEGTS_DEMUXER CONFIG_MPEGTS_MUXER; do
     grep -q "^$feature=yes$" "$config_mak" || { echo "Dolby Vision feature disabled: $feature"; exit 1; }
   done
+  grep -q 'ff_parse_itu_t_t35_to_dynamic_hdr_vivid' "$ff_stage/libavcodec/itut35.c" || { echo "FFmpeg mainline HDR Vivid T.35 parser is missing" >&2; exit 1; }
+  grep -q 'AV_FRAME_DATA_DYNAMIC_HDR_VIVID' "$ff_stage/libavcodec/hevc/hevcdec.c" || { echo "FFmpeg HEVC HDR Vivid frame metadata path is missing" >&2; exit 1; }
   [[ -s "$PREFIX/lib/libshaderc_combined.a" && -d "$PREFIX/include/shaderc" ]] || { echo "libshaderc static library or headers missing"; exit 1; }
   PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig" "$PKG_CONFIG" --exists shaderc || { echo "shaderc.pc is not usable"; exit 1; }
 
@@ -1618,6 +1614,18 @@ verify_lite_binary() {
     grep -Eq "[[:space:]]$name([[:space:]]|$)" <<< "$muxers" || { echo "Dolby Vision container muxer missing: $name"; exit 1; }
   done
   filters="$("$exe" -hide_banner -filters 2>/dev/null | tr -d '\r')"
+  grep -Eq "[[:space:]]hdr10plus([[:space:]]|$)" <<<"$filters" || { echo "HDR10+ producer filter missing"; exit 1; }
+  grep -q 'peak' <<<"$("$exe" -hide_banner -h filter=hdr10plus 2>&1)" || { echo "HDR10+ filter options missing"; exit 1; }
+  python3 -c 'import array,sys; sys.stdout.buffer.write((array.array("H", [512]) * (64*64*3)).tobytes())' |
+    "$exe" -hide_banner -loglevel error -f rawvideo -pixel_format gbrp10le -video_size 64x64 -framerate 1 -i pipe:0 \
+      -vf "setparams=colorspace=bt2020nc:color_primaries=bt2020:color_trc=smpte2084,hdr10plus" \
+      -frames:v 1 -c:v rawvideo -pix_fmt gbrp10le -f rawvideo pipe:1 >/dev/null || { echo "HDR10+ producer smoke test failed"; exit 1; }
+  for name in avs cavs; do
+    grep -Eq "[[:space:]]$name([[:space:]]|$)" <<<"$decoders" || { echo "Native AVS1 decoder missing: $name"; exit 1; }
+  done
+  for name in libdavs2 libuavs3d; do
+    if grep -Eq "[[:space:]]$name([[:space:]]|$)" <<<"$decoders"; then echo "External AVS2/3 decoder unexpectedly present: $name"; exit 1; fi
+  done
   hwaccels="$("$exe" -hide_banner -hwaccels 2>/dev/null | tr -d '\r')"
   if [[ "$BACKEND" == "nvenc" ]]; then
     grep -q '[[:space:]]av1_nvenc[[:space:]]' <<< "$output" || { echo "av1_nvenc missing"; exit 1; }
@@ -1695,6 +1703,9 @@ write_build_manifest() {
     --validate "final encoder whitelist contains AAC, libopus, and only expected video encoders"
     --validate "48 kHz stereo Ogg Opus encode and final-ffmpeg decode/re-encode roundtrip succeeded"
     --validate "native NMR AAC option remains present"
+    --validate "HDR10+ producer filter compiled and synthetic PQ-frame smoke test passed"
+    --validate "Native AVS1 decoders included; external AVS2/3 codecs and AVS encoders excluded; Audio Vivid/AV3A unavailable"
+    --validate "FFmpeg mainline HEVC decoding includes ITU-T T.35 HDR Vivid frame metadata parsing; HDR Vivid generation/encoding is unavailable"
     --validate "NVENC HDR10+ dynamic metadata passthrough source path compiled"
     --validate "Dolby Vision HEVC Profile 8 and AV1 Profile 10 per-frame RPU injection paths compiled"
     --skip "NVENC Dolby Vision P8/P10 injection was not round-trip tested on compatible hardware with Dolby Vision samples"
@@ -1932,7 +1943,7 @@ EOF
       fi
 
       configure_cmd+=(--disable-decoders)
-      for d in h264 hevc av1 vp9 vp8 mpeg2video mpeg4 msmpeg4v3 vc1 wmv3 mjpeg prores rawvideo libjxr aac aac_latm mp3 ac3 eac3 truehd dca flac opus vorbis wavpack alac pcm_s16le pcm_s24le pcm_s32le pcm_f32le pcm_f64le; do
+      for d in avs cavs h264 hevc av1 vp9 vp8 mpeg2video mpeg4 msmpeg4v3 vc1 wmv3 mjpeg prores rawvideo libjxr aac aac_latm mp3 ac3 eac3 truehd dca flac opus vorbis wavpack alac pcm_s16le pcm_s24le pcm_s32le pcm_f32le pcm_f64le; do
         add_if_exists "$ff_stage" --list-decoders "$d" --enable-decoder
       done
 
@@ -1948,7 +1959,7 @@ EOF
       configure_cmd+=(--disable-muxers)
       for m in matroska mp4 mov ipod mpegts null rawvideo image2 adts wav flac ogg; do add_if_exists "$ff_stage" --list-muxers "$m" --enable-muxer; done
       configure_cmd+=(--disable-parsers)
-      for p in h264 hevc av1 aac ac3 dca mlp opus vorbis mjpeg vp9 vp8 mpeg4video vc1; do add_if_exists "$ff_stage" --list-parsers "$p" --enable-parser; done
+      for p in cavsvideo h264 hevc av1 aac ac3 dca mlp opus vorbis mjpeg vp9 vp8 mpeg4video vc1; do add_if_exists "$ff_stage" --list-parsers "$p" --enable-parser; done
       configure_cmd+=(--disable-bsfs)
       for b in h264_mp4toannexb hevc_mp4toannexb av1_metadata h264_metadata hevc_metadata aac_adtstoasc extract_extradata dovi_rpu dovi_split; do add_if_exists "$ff_stage" --list-bsfs "$b" --enable-bsf; done
       configure_cmd+=(--disable-protocols)
@@ -1965,7 +1976,7 @@ EOF
       printf '%s\n' "${configure_cmd[@]}" > "$BUILDROOT/ffmpeg-configure.args"
       printf '%q ' "${configure_cmd[@]}"; echo
       "${configure_cmd[@]}"
-      validate_config ffbuild/config.mak config.h
+      validate_config ffbuild/config.mak config.h "$ff_stage"
       mkdir -p libswscale/x86
       make -f ./Makefile -j"$FFMPEG_JOBS"
       make -f ./Makefile install
