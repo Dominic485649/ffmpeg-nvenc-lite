@@ -14,7 +14,7 @@
 | 原始帧输出 | `rawvideo` |
 | 音频编码 | 原生 `aac`（含 NMR 参数）、`libopus` |
 | 视频解码 | H.264、HEVC、AV1、VP8/VP9、MPEG-2/4、VC-1、MJPEG、ProRes、原生 AVS1 等白名单 |
-| 音频解码 | AAC、MP3、AC-3/E-AC-3、TrueHD、DTS、FLAC、Opus、Vorbis、WavPack、ALAC、部分 PCM 等白名单 |
+| 音频解码 | AAC、MP3、AC-3/E-AC-3、TrueHD、DTS、FLAC、Opus、WavPack、ALAC、部分 PCM 等白名单 |
 | NVIDIA 硬解 | NVDEC，结合 FFmpeg 原生解码器与 `-hwaccel cuda` 使用 |
 | CUDA 滤镜 | `scale_cuda`、`overlay_cuda`、`pad_cuda`、`colorspace_cuda`、`yadif_cuda`、`bwdif_cuda`、`bilateral_cuda`、`chromakey_cuda`、`thumbnail_cuda`、`transpose_cuda`、`hwupload_cuda` |
 | 图像与色彩处理 | libplacebo、Vulkan、Shaderc、SPIR-V 与硬件上下文互操作 |
@@ -109,10 +109,12 @@ ffmpeg.exe -i input.wav -vn -c:a aac -aac_coder nmr -aac_nmr_speed 0 -b:a 192k o
 使用现有源码构建：
 
 ```bash
-./ffmpeg.sh build
+JOBS=2 FFMPEG_JOBS=2 NVCC_THREADS=1 ./ffmpeg.sh build
 ```
 
-不带参数或使用 `all` 会依次更新源码并构建。构建期间会核验受管理工具链，工具链版本查询与 Shaderc 固定依赖准备可能需要联网。
+目标 C/C++ 组件与 FFmpeg 使用 **ThinLTO**。可通过 `JOBS`、`FFMPEG_JOBS` 与 `NVCC_THREADS` 调整构建并发；上例使用两个编译作业。
+
+不带参数或使用 `all` 会依次更新源码并构建。默认会查询并核验受管理工具链版本；工具链已准备好时，`TOOLCHAIN_REFRESH=0` 可显式复用已安装且验证有效的版本。Shaderc 固定依赖准备可能需要联网。
 
 | 用途 | 默认路径 |
 |---|---|
@@ -129,7 +131,7 @@ ffmpeg.exe -i input.wav -vn -c:a aac -aac_coder nmr -aac_nmr_speed 0 -b:a 192k o
 
 ## 实测与许可证
 
-2026-11-03 本地产物已通过隔离运行与导入依赖检查，并在 RTX 4060 Laptop 上完成 CUDA 缩放、HEVC/AV1 NVENC 编码和 libplacebo/Vulkan 处理。SoXR、Opus 编码/原生解码与 AAC 编码通过；相同输入的二次构建为 **8/8 唯一阶段内容缓存复用**。
+2026-11-07 本地产物已通过隔离单 EXE 运行、系统/驱动依赖、PE64/CFG、实际 ThinLTO 产物核验与完整离线回归。在 RTX 4060 Laptop 上完成 CUDA 缩放、HEVC/AV1 NVENC 编码及 libplacebo/Vulkan 实际处理，并核对输出帧数。SoXR、NMR AAC、Opus 编解码往返和原生 Ogg/Opus 解码通过。
 
 各版本的程序身份、文件体积与验证信息见对应 Release。
 
