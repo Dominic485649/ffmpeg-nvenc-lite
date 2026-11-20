@@ -17,7 +17,7 @@
 | 音频解码 | AAC、MP3、AC-3/E-AC-3、TrueHD、DTS、FLAC、Opus、WavPack、ALAC、部分 PCM 等白名单 |
 | NVIDIA 硬解 | NVDEC，结合 FFmpeg 原生解码器与 `-hwaccel cuda` 使用 |
 | CUDA 滤镜 | `scale_cuda`、`overlay_cuda`、`pad_cuda`、`colorspace_cuda`、`yadif_cuda`、`bwdif_cuda`、`bilateral_cuda`、`chromakey_cuda`、`thumbnail_cuda`、`transpose_cuda`、`hwupload_cuda` |
-| 图像与色彩处理 | libplacebo、Vulkan、Shaderc、SPIR-V 与硬件上下文互操作 |
+| 图像与色彩处理 | libplacebo、Vulkan、Shaderc、SPIR-V 与硬件上下文互操作；LCMS2、ICC 配置检测与生成 |
 | CPU 与基础滤镜 | `scale`、`crop`、`fps`、旋转、翻转、时间戳处理与硬件帧上传/下载 |
 | 音频处理 | SoXR 重采样与基础音频格式、时间戳处理 |
 | 常用文件 | Matroska、MP4/MOV、MPEG-TS、Ogg、WAV、FLAC，以及白名单中的裸流与原始数据 |
@@ -119,20 +119,19 @@ JOBS=2 FFMPEG_JOBS=2 NVCC_THREADS=1 ./ffmpeg.sh build
 | 用途 | 默认路径 |
 |---|---|
 | 依赖源码 | `sources/` |
-| 依赖安装前缀 | `bin_nvenc/` |
-| 构建与内容缓存 | `build_nvenc/` |
+| 私有安装前缀 | `bin_nvenc/` |
+| 私有构建与内容缓存 | `build_nvenc/` |
+| Lite 公共依赖缓存 | `build_shared_deps/` |
 | 最终程序 | **`nvenc/ffmpeg.exe`** |
 
-目标外部依赖为 nv-codec-headers、Opus、SoXR、Shaderc、Vulkan-Headers 和 libplacebo，另有原生 host-glslc 构建阶段。阶段缓存按源码、配置、工具链、依赖和产物内容核验；构建清单记录实际提交、参数与程序身份。FFmpeg 默认跟踪 `master`。
+目标外部依赖为 nv-codec-headers、Opus、SoXR、Shaderc、Vulkan-Headers、LCMS2 和 libplacebo，另有原生 host-glslc 构建阶段。同一工作区内，工具链和编译配置相同的 Lite 公共依赖按内容校验后复用；设置 `FFBUILD_LITE_SHARED_DEPS=0` 可使用私有前缀。构建清单记录实际提交、参数与程序身份。FFmpeg 默认跟踪 `master`。
 
 ## FFmpegFreeUI 预设
 
 若 Release 附带 JSON，可作为 [FFmpegFreeUI](https://github.com/Lake1059/FFmpegFreeUI) v6 用户预设放入 `Preset_v6\User`。预设作为可选独立附件提供；使用前请确认编码器、滤镜与本机路径匹配。
 
-## 实测与许可证
+## 验证与许可证
 
-2026-11-07 本地产物已通过隔离单 EXE 运行、系统/驱动依赖、PE64/CFG、实际 ThinLTO 产物核验与完整离线回归。在 RTX 4060 Laptop 上完成 CUDA 缩放、HEVC/AV1 NVENC 编码及 libplacebo/Vulkan 实际处理，并核对输出帧数。SoXR、NMR AAC、Opus 编解码往返和原生 Ogg/Opus 解码通过。
-
-各版本的程序身份、文件体积与验证信息见对应 Release。
+程序版本、SHA-256、文件体积与实际通过的用例列在[对应 Release](https://github.com/Dominic485649/ffmpeg-nvenc-lite/releases) 中。
 
 自有脚本与文档采用 [MIT License](https://github.com/Dominic485649/ffmpeg-nvenc-lite/blob/main/LICENSE)。本配置的 FFmpeg 标识为 **`nonfree and unredistributable`**；FFmpeg、外部库、驱动与安装器组件适用各自许可证，使用与分发须满足相应许可要求。

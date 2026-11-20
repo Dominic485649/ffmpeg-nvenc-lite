@@ -48,6 +48,7 @@ declare -A URLS=(
   [libshaderc]="https://github.com/google/shaderc.git"
   [vulkan-headers]="https://github.com/KhronosGroup/Vulkan-Headers.git"
   [libplacebo]="https://github.com/haasn/libplacebo.git"
+  [lcms2]="https://github.com/mm2/Little-CMS.git"
 )
 
 declare -A TAG_REGEX=(
@@ -59,9 +60,10 @@ declare -A TAG_REGEX=(
   [libshaderc]='^v[0-9]+\.[0-9]+$'
   [vulkan-headers]='^v[0-9]+(\.[0-9]+)*$'
   [libplacebo]='^v[0-9]+(\.[0-9]+)*$'
+  [lcms2]='^lcms[0-9]+(\.[0-9]+)*$'
 )
 
-COMMON_STAGES=(opus libsoxr libshaderc vulkan-headers libplacebo)
+COMMON_STAGES=(opus libsoxr libshaderc vulkan-headers lcms2 libplacebo)
 if [[ "$BACKEND" == "nvenc" ]]; then
   STAGES=(nv-codec-headers "${COMMON_STAGES[@]}" ffmpeg)
 else
@@ -73,7 +75,7 @@ COMMON_FILTERS=(
   buffer buffersink abuffer abuffersink format aformat alphamerge null anull
   fps trim atrim setpts asetpts settb asettb setparams setsar
   crop hflip vflip transpose rotate scale aresample
-  hwupload hwdownload hwmap libplacebo
+  hwupload hwdownload hwmap libplacebo iccdetect iccgen
 )
 NVENC_FILTERS=(scale_cuda overlay_cuda pad_cuda colorspace_cuda yadif_cuda bwdif_cuda bilateral_cuda chromakey_cuda thumbnail_cuda transpose_cuda hwupload_cuda)
 QSV_FILTERS=(scale_qsv vpp_qsv deinterlace_qsv overlay_qsv hstack_qsv vstack_qsv xstack_qsv)
@@ -168,95 +170,22 @@ run_stage_recipe() {
       }
       ;;
 
-    opus)
-      build_opus || return 1
-      ;;
-
     libvpl)
       build_cmake libvpl -DBUILD_TESTS=OFF -DBUILD_EXAMPLES=OFF -DINSTALL_EXAMPLES=OFF -DENABLE_WARNINGS=OFF || return 1
       ;;
 
-    libsoxr)
-      build_cmake libsoxr -Wno-dev --no-warn-unused-cli -DBUILD_TESTS=OFF -DBUILD_EXAMPLES=OFF -DWITH_OPENMP=OFF -DWITH_LSR_BINDINGS=OFF -DCMAKE_POLICY_VERSION_MINIMUM=3.10 || return 1
-      write_soxr_pc || return 1
-      ;;
-
-    libshaderc)
-      build_shaderc_from_source || return 1
-      ;;
-
-    vulkan-headers)
-      local s
-      s="$(stage_src vulkan-headers)" || return 1
-      local vk_version
-      vk_version="$(git -C "$s" describe --tags --always 2>/dev/null | sed 's/^v//' | sed 's/-.*//')"
-      mkdir -p "$PREFIX/include" "$PREFIX/lib" "$PREFIX/lib/pkgconfig" || return 1
-      cp -rf "$s/include/"* "$PREFIX/include/" || return 1
-      cat > "$PREFIX/lib/vulkan-1.def" <<EOF || return 1
-LIBRARY vulkan-1.dll
-EXPORTS
-vkGetInstanceProcAddr
-EOF
-      "$DLLTOOL" -d "$PREFIX/lib/vulkan-1.def" -l "$PREFIX/lib/libvulkan-1.dll.a" -D vulkan-1.dll || return 1
-      cp -f "$PREFIX/lib/libvulkan-1.dll.a" "$PREFIX/lib/libvulkan.dll.a" || return 1
-      cp -f "$PREFIX/lib/libvulkan-1.dll.a" "$PREFIX/lib/libvulkan-1.a" || return 1
-      cp -f "$PREFIX/lib/libvulkan.dll.a" "$PREFIX/lib/libvulkan.a" || return 1
-      cat > "$PREFIX/lib/pkgconfig/vulkan.pc" <<EOF || return 1
-prefix=$PREFIX
-exec_prefix=\${prefix}
-libdir=\${exec_prefix}/lib
-includedir=\${prefix}/include
-
-Name: Vulkan-Loader
-Description: Windows Vulkan loader import library
-Version: $vk_version
-Libs: -L\${libdir} -lvulkan-1
-Cflags: -I\${includedir}
-EOF
-      ;;
-
-    libplacebo)
-      PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig" "$PKG_CONFIG" --exists shaderc vulkan || { echo "shaderc/vulkan pkg-config missing"; exit 1; }
-      local s b
-      s="$(stage_src libplacebo)" || return 1
-      b="$(lite_build_directory libplacebo)" || return 1
-      local meson_setup=(setup)
-      [[ "${LITE_REUSE_OBJECTS:-0}" != 1 ]] || meson_setup+=(--reconfigure)
-      meson "${meson_setup[@]}" "$b" "$s" \
-        --cross-file "$BUILDROOT/mingw-cross.txt" \
-        --prefix "$PREFIX" \
-        --buildtype release \
-        --default-library=static \
-        -Ddemos=false \
-        -Dtests=false \
-        -Dvulkan=enabled \
-        -Dshaderc=enabled \
-        -Dopengl=disabled \
-        -Dlcms=disabled \
-        -Ddovi=enabled \
-        -Dlibdovi=disabled \
-        -Dxxhash=disabled || return 1
-      meson compile -C "$b" -j "$JOBS" || return 1
-      meson install --no-rebuild -C "$b" || return 1
-      lite_assert_installed_copy "$b/src/libplacebo.a" "$PREFIX/lib/libplacebo.a" || return 1
-      lite_assert_installed_copy "$b/src/include/libplacebo/config.h" "$PREFIX/include/libplacebo/config.h" || return 1
-      grep -q '^#define PL_HAVE_DOVI 1$' "$PREFIX/include/libplacebo/config.h" || {
-        echo "libplacebo Dolby Vision support is disabled"
-        exit 1
-      }
-      grep -q '^pl_has_vk_proc_addr=1' "$PREFIX/lib/pkgconfig/libplacebo.pc" || { echo "libplacebo did not link Vulkan proc addr"; exit 1; }
-      ;;
-
     ffmpeg)
       # Host/CUDA and direct-dependency identities were resolved by run_stage.
-      PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig" "$PKG_CONFIG" --exists soxr libplacebo shaderc vulkan || { echo "required pkg-config files missing"; exit 1; }
+      "$PKG_CONFIG" --static --exists soxr libplacebo shaderc vulkan lcms2 || { echo "required pkg-config files missing"; return 1; }
       [[ "$BACKEND" == "qsv" ]] && PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig" "$PKG_CONFIG" --exists vpl || { [[ "$BACKEND" == "nvenc" ]] || exit 1; }
       [[ "$BACKEND" == "nvenc" ]] && PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig" "$PKG_CONFIG" --exists ffnvcodec || { [[ "$BACKEND" == "qsv" ]] || exit 1; }
 
-      local ff_stage ff_bld extra_cflags extra_ldflags extra_libs ffmpeg_nvccflags
+      local ff_stage ff_bld extra_cflags extra_ldflags extra_libs ffmpeg_nvccflags dep_prefix
+      dep_prefix="$(lite_dependency_prefix)" || return 1
       ff_stage="$(stage_src ffmpeg-source)" || return 1
       "$FFBUILD_CODE_ROOT/shared-patches/apply-ffmpeg-patches.sh" "$ff_stage" lite || return 1
       python3 -I "$FFBUILD_CODE_ROOT/scripts/lib/feature_policy.py" ffmpeg-source "$ff_stage" || return 1
+      python3 -I "$FFBUILD_CODE_ROOT/scripts/lib/feature_policy.py" ffmpeg-restricted-cli "$ff_stage" || return 1
       patch_ffmpeg_libplacebo_vulkan_import "$ff_stage" || return 1
       ff_bld="$(lite_build_directory ffmpeg)" || return 1
       mkdir -p "$ff_bld" || return 1
@@ -265,6 +194,10 @@ EOF
 
       extra_cflags="-I$PREFIX/include"
       extra_ldflags="-L$PREFIX/lib $LDFLAGS"
+      if [[ "$dep_prefix" != "$PREFIX" ]]; then
+        extra_cflags="-I$dep_prefix/include $extra_cflags"
+        extra_ldflags="-L$dep_prefix/lib $extra_ldflags"
+      fi
       extra_libs="-lvulkan-1 -lshlwapi -lpthread"
       configure_cmd=(
         "$ff_stage/configure"
@@ -303,6 +236,7 @@ EOF
         --enable-vulkan
         --enable-vulkan-static
         --enable-libplacebo
+        --enable-lcms2
         --disable-opencl
         --enable-lto=thin
       )
@@ -390,7 +324,7 @@ EOF
       verify_nvenc_hierarchical "$OUTPUT_DIR/ffmpeg.exe" || return 1
       ;;
 
-    *) echo "unknown stage: $stage"; exit 1 ;;
+    *) run_lite_common_recipe "$stage" || return 1 ;;
   esac
 }
 
